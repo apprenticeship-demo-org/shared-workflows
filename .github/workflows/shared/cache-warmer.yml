@@ -1,0 +1,547 @@
+# shared/cache-warmer.yml — Centralised dependency cache warm-up workflow.
+#
+# ── Purpose ──────────────────────────────────────────────────────────────────
+# Runs BEFORE the profile job in pipeline.yml to pre-populate every Actions
+# cache that the profile will later try to restore. When the profile job
+# runs its own cache-restore steps it gets an immediate hit, saving minutes
+# of network downloads on every CI run.
+#
+# ── Critical contract ────────────────────────────────────────────────────────
+# EVERY cache key defined in this file must be BYTE-FOR-BYTE IDENTICAL to the
+# corresponding key used in the profile workflow (java.yml / python.yml /
+# javascript.yml / devops.yml). A single character difference means the warm
+# cache is saved under a different key and the profile never finds it.
+# The keys below are kept in sync with the profile files by design — if you
+# change a key in a profile you must change it here too.
+#
+# ── How GitHub Actions cache saving works ────────────────────────────────────
+# actions/cache@v4 restores a cache at the start of a step and automatically
+# saves the (possibly updated) cache at the end of the JOB, not the step.
+# This means: restore the cache → run the install command → job ends →
+# Actions saves the now-populated cache directory under the primary key.
+# The next run (the profile job) restores it and finds the full contents.
+#
+# ── Inputs ───────────────────────────────────────────────────────────────────
+# All version inputs default to the same values as the profile workflows so
+# the warm cache is built against the same toolchain version that will restore
+# it. If pipeline.yml passes overrides they must be forwarded here too.
+
+name: Cache Warmer
+
+on:
+  workflow_call:
+    inputs:
+      profile:
+        description: "Tech profile whose cache to warm: java | python | javascript | devops"
+        required: true
+        type: string
+      java-version:
+        description: "Java version — must match profiles/java.yml default"
+        required: false
+        type: string
+        default: "21"
+      python-version:
+        description: "Python version — must match profiles/python.yml default"
+        required: false
+        type: string
+        default: "3.12"
+      node-version:
+        description: "Node.js version — must match profiles/javascript.yml default"
+        required: false
+        type: string
+        default: "20"
+      terraform-version:
+        description: "Terraform version — must match profiles/devops.yml default"
+        required: false
+        type: string
+        default: "latest"
+      working-directory:
+        description: "Root directory containing dependency manifests"
+        required: false
+        type: string
+        default: "."
+
+env:
+  # Mirrors the env var set in devops.yml so Terraform writes providers into
+  # the same cache directory path that devops.yml will later restore from.
+  TF_PLUGIN_CACHE_DIR: ~/.terraform.d/plugin-cache
+
+jobs:
+  warm:
+    name: Warm ${{ inputs.profile }} cache
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+
+    steps:
+
+      # ── Checkout ──────────────────────────────────────────────────────────
+      # Required so hash functions (hashFiles) can read the real lock files
+      # from the calling repository. Without checkout, hashFiles returns empty
+      # strings and the cache keys won't match the profile workflow's keys.
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ══════════════════════════════════════════════════════════════════════
+      #  JAVA
+      # ══════════════════════════════════════════════════════════════════════
+      # Warms two caches used by profiles/java.yml:
+      #   1. Maven wrapper binary  (.mvn/wrapper)
+      #   2. Maven local repository (~/.m2/repository)
+      #
+      # Strategy: restore → run dependency:go-offline (downloads all deps
+      # without compiling) → job ends → Actions saves updated cache.
+      # dependency:go-offline is preferred over a full mvn verify because it
+      # only downloads jars and skips compilation/tests, making the warm run
+      # fast but thorough — every transitive dependency is fetched.
+      # SNAPSHOT dependencies are pruned before cache save for the same reason
+      # as in java.yml: they change constantly and pollute the cache.
+
+      - name: Java — set up JDK ${{ inputs.java-version }}
+        if: inputs.profile == 'java'
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java-version }}
+          distribution: temurin
+
+      # KEY MUST MATCH profiles/java.yml step "Restore Maven wrapper cache"
+      - name: Java — restore Maven wrapper cache
+        if: inputs.profile == 'java'
+        id: cache-mvn-wrapper
+        uses: actions/cache@v4
+        with:
+          path: .mvn/wrapper
+          key: ${{ runner.os }}-mvn-wrapper-${{ hashFiles('.mvn/wrapper/maven-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-mvn-wrapper-
+
+      # KEY MUST MATCH profiles/java.yml step "Restore Maven repository cache"
+      - name: Java — restore Maven repository cache
+        if: inputs.profile == 'java'
+        id: cache-maven
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+
+      # Download all compile, test, and plugin dependencies declared in pom.xml
+      # without running compilation or tests. This populates ~/.m2/repository
+      # with every JAR the subsequent profile build will need.
+      # go-offline resolves transitive deps; dependency:resolve-plugins adds
+      # Maven plugin JARs (checkstyle, jacoco, surefire, etc.).
+      - name: Java — pre-download all Maven dependencies
+        if: inputs.profile == 'java' && steps.cache-maven.outputs.cache-hit != 'true'
+        run: |
+          if [[ -f ./mvnw ]]; then
+            ./mvnw --batch-mode --no-transfer-progress \
+              dependency:go-offline \
+              dependency:resolve-plugins \
+              -q || true
+          elif [[ -f pom.xml ]]; then
+            mvn --batch-mode --no-transfer-progress \
+              dependency:go-offline \
+              dependency:resolve-plugins \
+              -q || true
+          else
+            echo "No pom.xml or mvnw found — Java dep pre-download skipped"
+          fi
+
+      # Mirror the SNAPSHOT pruning in java.yml so stale -SNAPSHOT jars are
+      # evicted from the cache before Actions saves it at job end.
+      - name: Java — prune SNAPSHOT dependencies from cache
+        if: inputs.profile == 'java'
+        run: find ~/.m2/repository -name "*SNAPSHOT*" -delete 2>/dev/null || true
+
+      # ══════════════════════════════════════════════════════════════════════
+      #  PYTHON
+      # ══════════════════════════════════════════════════════════════════════
+      # Warms three cache layers used by profiles/python.yml:
+      #   1. setup-python built-in pip cache  (layer 1 — handled by the action)
+      #   2. ~/.cache/pip                     (layer 2 — explicit two-level key)
+      #   3. .venv                            (layer 3 — virtualenv directory)
+      #
+      # Strategy: restore → pip install common packages + requirements.txt →
+      # job ends → Actions saves all three cache directories.
+
+      - name: Python — set up Python ${{ inputs.python-version }}
+        if: inputs.profile == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: pip   # layer 1: setup-python built-in cache
+
+      # KEY MUST MATCH profiles/python.yml step "Restore pip package cache"
+      - name: Python — restore pip cache (layer 2)
+        if: inputs.profile == 'python'
+        id: cache-pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ inputs.python-version }}-${{ hashFiles('**/requirements*.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-${{ inputs.python-version }}-
+            ${{ runner.os }}-pip-
+
+      # KEY MUST MATCH profiles/python.yml step "Restore virtual environment cache"
+      - name: Python — restore venv cache (layer 3)
+        if: inputs.profile == 'python'
+        id: cache-venv
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: ${{ runner.os }}-venv-${{ inputs.python-version }}-${{ hashFiles('**/requirements*.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-venv-${{ inputs.python-version }}-
+
+      # Install universal packages first so they are in the cache regardless
+      # of what any individual lab repo declares in requirements.txt.
+      # Then install from requirements.txt if present so the venv cache
+      # contains the full set of project dependencies ready for tests.
+      - name: Python — pre-install universal and project dependencies
+        if: inputs.profile == 'python' && steps.cache-pip.outputs.cache-hit != 'true'
+        run: |
+          python -m pip install --upgrade pip
+          # Universal packages present in almost every apprenticeship lab
+          pip install --quiet pytest pytest-cov flake8 requests
+          # Project-specific dependencies (may not exist in all repos)
+          if [[ -f requirements.txt ]]; then
+            pip install --quiet -r requirements.txt
+          elif [[ -f requirements-dev.txt ]]; then
+            pip install --quiet -r requirements-dev.txt
+          fi
+
+      # ══════════════════════════════════════════════════════════════════════
+      #  JAVASCRIPT
+      # ══════════════════════════════════════════════════════════════════════
+      # Warms up to six caches used by profiles/javascript.yml:
+      #   • One of: ~/.npm / ~/.yarn/cache / ~/.pnpm-store / ~/.bun/install/cache
+      #     (exactly one, determined by detecting the lock file)
+      #   • Optionally: ~/.cache/ms-playwright  (if @playwright/test in package.json)
+      #   • Optionally: ~/.cache/Cypress        (if cypress in package.json)
+      #
+      # The package manager is detected here using the same logic as the detect
+      # step in javascript.yml so the same lock file → same cache key path.
+
+      - name: JavaScript — set up Node.js ${{ inputs.node-version }}
+        if: inputs.profile == 'javascript'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      # Detect PM and E2E tools; write outputs used by all subsequent JS steps.
+      # Logic mirrors profiles/javascript.yml step "Detect tooling" exactly so
+      # the detected PM value produces the same cache keys.
+      - name: JavaScript — detect package manager and E2E tools
+        if: inputs.profile == 'javascript'
+        id: js-detect
+        run: |
+          # Package manager — same lock-file priority order as javascript.yml
+          if   [[ -f pnpm-lock.yaml ]]; then PM=pnpm
+          elif [[ -f yarn.lock      ]]; then PM=yarn
+          elif [[ -f bun.lockb      ]]; then PM=bun
+          else                               PM=npm
+          fi
+          echo "pm=$PM" >> "$GITHUB_OUTPUT"
+          echo "Detected package manager: $PM"
+
+          # E2E tools — only if declared in package.json
+          DEPS=$(cat package.json 2>/dev/null || echo "{}")
+          if   echo "$DEPS" | grep -q '"@playwright/test"'; then E2E=playwright
+          elif echo "$DEPS" | grep -q '"cypress"';          then E2E=cypress
+          else                                                   E2E=none
+          fi
+          echo "e2e=$E2E" >> "$GITHUB_OUTPUT"
+          echo "Detected E2E: $E2E"
+
+      # Install PM extras before the cache restore so the correct binary
+      # exists when the install command runs later in this job.
+      - name: JavaScript — set up pnpm
+        if: inputs.profile == 'javascript' && steps.js-detect.outputs.pm == 'pnpm'
+        run: npm install -g pnpm
+
+      - name: JavaScript — set up yarn (corepack)
+        if: inputs.profile == 'javascript' && steps.js-detect.outputs.pm == 'yarn'
+        run: corepack enable
+
+      - name: JavaScript — set up bun
+        if: inputs.profile == 'javascript' && steps.js-detect.outputs.pm == 'bun'
+        run: npm install -g bun
+
+      # ── JS dependency caches (one activates per PM) ────────────────────────
+      # KEYS MUST MATCH profiles/javascript.yml steps "Restore * cache"
+
+      - name: JavaScript — restore npm cache
+        if: inputs.profile == 'javascript' && steps.js-detect.outputs.pm == 'npm'
+        id: cache-npm
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-npm-
+
+      - name: JavaScript — restore yarn cache
+        if: inputs.profile == 'javascript' && steps.js-detect.outputs.pm == 'yarn'
+        id: cache-yarn
+        uses: actions/cache@v4
+        with:
+          path: ~/.yarn/cache
+          key: ${{ runner.os }}-yarn-${{ hashFiles('yarn.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+
+      - name: JavaScript — restore pnpm store cache
+        if: inputs.profile == 'javascript' && steps.js-detect.outputs.pm == 'pnpm'
+        id: cache-pnpm
+        uses: actions/cache@v4
+        with:
+          path: ~/.pnpm-store
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-
+
+      - name: JavaScript — restore bun cache
+        if: inputs.profile == 'javascript' && steps.js-detect.outputs.pm == 'bun'
+        id: cache-bun
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('bun.lockb') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+
+      # ── JS E2E browser caches ──────────────────────────────────────────────
+      # KEYS MUST MATCH profiles/javascript.yml steps "Restore Playwright/Cypress cache"
+
+      - name: JavaScript — restore Playwright browser cache
+        if: inputs.profile == 'javascript' && steps.js-detect.outputs.e2e == 'playwright'
+        id: cache-playwright
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('package-lock.json', 'yarn.lock', 'pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-playwright-
+
+      - name: JavaScript — restore Cypress browser cache
+        if: inputs.profile == 'javascript' && steps.js-detect.outputs.e2e == 'cypress'
+        id: cache-cypress
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/Cypress
+            node_modules/.cache/cypress
+          key: ${{ runner.os }}-cypress-${{ hashFiles('package-lock.json', 'yarn.lock', 'pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-cypress-
+
+      # Install all project dependencies using frozen mode so node_modules and
+      # the PM store are fully populated before the cache-save at job end.
+      # Frozen mode also validates that lock files are in sync with package.json.
+      - name: JavaScript — install dependencies (frozen)
+        if: inputs.profile == 'javascript'
+        run: |
+          case "${{ steps.js-detect.outputs.pm }}" in
+            npm)  npm ci ;;
+            yarn) yarn install --frozen-lockfile ;;
+            pnpm) pnpm install --frozen-lockfile ;;
+            bun)  bun install --frozen-lockfile ;;
+          esac
+
+      # Install Playwright browser binaries only on a cache miss. Mirrors the
+      # conditional install logic in profiles/javascript.yml step 8.
+      - name: JavaScript — install Playwright Chromium (cache miss)
+        if: >
+          inputs.profile == 'javascript' &&
+          steps.js-detect.outputs.e2e == 'playwright' &&
+          steps.cache-playwright.outputs.cache-hit != 'true'
+        run: npx playwright install chromium --with-deps
+
+      # Install Cypress binary only on a cache miss. Mirrors javascript.yml step 8.
+      - name: JavaScript — install Cypress binary (cache miss)
+        if: >
+          inputs.profile == 'javascript' &&
+          steps.js-detect.outputs.e2e == 'cypress' &&
+          steps.cache-cypress.outputs.cache-hit != 'true'
+        run: npx cypress install
+
+      # ══════════════════════════════════════════════════════════════════════
+      #  DEVOPS
+      # ══════════════════════════════════════════════════════════════════════
+      # Warms four caches used by profiles/devops.yml:
+      #   1. ~/.cache/pip               (yamllint)
+      #   2. ~/.terraform.d/plugin-cache (Terraform providers)
+      #   3. ~/.tflint.d/plugins         (TFLint rule sets)
+      #   4. ~/.cache/helm               (Helm chart deps)
+      #
+      # Only caches for tooling that the repository actually uses are warmed —
+      # if there are no .tf files the Terraform and TFLint caches are skipped.
+
+      # KEY MUST MATCH profiles/devops.yml step "Restore pip cache"
+      - name: DevOps — restore pip cache (yamllint)
+        if: inputs.profile == 'devops'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-devops-pip
+          restore-keys: |
+            ${{ runner.os }}-devops-pip
+
+      - name: DevOps — install yamllint
+        if: inputs.profile == 'devops'
+        run: pip install --quiet yamllint
+
+      # Detect which DevOps tooling the repo uses before touching the heavier
+      # caches. This mirrors the detection gates in devops.yml and avoids
+      # spinning up Terraform or Helm for repos that don't use them.
+      - name: DevOps — detect tooling presence
+        if: inputs.profile == 'devops'
+        id: devops-detect
+        run: |
+          # Terraform: any .tf file outside .terraform/ directory
+          if find . -name "*.tf" -not -path "./.terraform/*" | grep -q .; then
+            echo "has_terraform=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "has_terraform=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # TFLint config
+          [[ -f .tflint.hcl ]] \
+            && echo "has_tflint=true"  >> "$GITHUB_OUTPUT" \
+            || echo "has_tflint=false" >> "$GITHUB_OUTPUT"
+
+          # Helm: any Chart.yaml in the repo
+          if find . -name "Chart.yaml" -not -path "./node_modules/*" | grep -q .; then
+            echo "has_helm=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "has_helm=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # KEY MUST MATCH profiles/devops.yml step "Restore Terraform provider plugin cache"
+      - name: DevOps — restore Terraform provider plugin cache
+        if: inputs.profile == 'devops' && steps.devops-detect.outputs.has_terraform == 'true'
+        id: cache-terraform
+        uses: actions/cache@v4
+        with:
+          path: ~/.terraform.d/plugin-cache
+          key: ${{ runner.os }}-terraform-${{ hashFiles('**/*.tf') }}
+          restore-keys: |
+            ${{ runner.os }}-terraform-
+
+      # Ensure the plugin cache directory exists before terraform init runs so
+      # TF_PLUGIN_CACHE_DIR is honoured. Mirrors the devops.yml mkdir step.
+      - name: DevOps — create Terraform plugin cache directory
+        if: inputs.profile == 'devops' && steps.devops-detect.outputs.has_terraform == 'true'
+        run: mkdir -p ~/.terraform.d/plugin-cache
+
+      - name: DevOps — set up Terraform
+        if: inputs.profile == 'devops' && steps.devops-detect.outputs.has_terraform == 'true'
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+
+      # Run terraform init to download providers into the plugin cache.
+      # -backend=false avoids needing remote state credentials.
+      # The || true prevents a warm-up failure from blocking the real CI run —
+      # if init fails here the profile job will surface the real error.
+      - name: DevOps — warm Terraform provider cache
+        if: >
+          inputs.profile == 'devops' &&
+          steps.devops-detect.outputs.has_terraform == 'true' &&
+          steps.cache-terraform.outputs.cache-hit != 'true'
+        run: terraform init -backend=false -input=false || true
+
+      # KEY MUST MATCH profiles/devops.yml step "Restore TFLint plugin cache"
+      - name: DevOps — restore TFLint plugin cache
+        if: inputs.profile == 'devops' && steps.devops-detect.outputs.has_terraform == 'true'
+        id: cache-tflint
+        uses: actions/cache@v4
+        with:
+          path: ~/.tflint.d/plugins
+          key: ${{ runner.os }}-tflint-${{ hashFiles('.tflint.hcl') }}
+          restore-keys: |
+            ${{ runner.os }}-tflint-
+
+      - name: DevOps — set up TFLint and warm plugin cache
+        if: >
+          inputs.profile == 'devops' &&
+          steps.devops-detect.outputs.has_terraform == 'true' &&
+          steps.cache-tflint.outputs.cache-hit != 'true'
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: latest
+
+      - name: DevOps — initialise TFLint plugins
+        if: >
+          inputs.profile == 'devops' &&
+          steps.devops-detect.outputs.has_terraform == 'true' &&
+          steps.cache-tflint.outputs.cache-hit != 'true'
+        run: tflint --init || true
+
+      # KEY MUST MATCH profiles/devops.yml step "Restore Helm chart dependency cache"
+      - name: DevOps — restore Helm chart dependency cache
+        if: inputs.profile == 'devops' && steps.devops-detect.outputs.has_helm == 'true'
+        id: cache-helm
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/helm
+          key: ${{ runner.os }}-helm-${{ hashFiles('**/Chart.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-helm-
+
+      # Update Helm chart dependencies (helm dependency update) so the chart
+      # dep tarballs are written into ~/.cache/helm before the cache saves.
+      - name: DevOps — warm Helm chart dependency cache
+        if: >
+          inputs.profile == 'devops' &&
+          steps.devops-detect.outputs.has_helm == 'true' &&
+          steps.cache-helm.outputs.cache-hit != 'true'
+        run: |
+          find . -name "Chart.yaml" -not -path "./node_modules/*" \
+            -exec dirname {} \; | sort -u | while read -r chart_dir; do
+            echo "Updating Helm deps for: $chart_dir"
+            helm dependency update "$chart_dir" || true
+          done
+
+      # ── Warm-up summary ────────────────────────────────────────────────────
+      # Always printed so the pipeline log shows what was warmed vs skipped.
+      # "WARMED" = the install ran and the cache will be saved at job end.
+      # "HIT"    = an existing cache was restored; no install needed.
+      # "SKIP"   = tooling not present in this repo; cache not written.
+      - name: Cache warm-up summary
+        if: always()
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  Cache Warmer Summary — profile: ${{ inputs.profile }}"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          case "${{ inputs.profile }}" in
+            java)
+              echo "  Maven wrapper : ${{ steps.cache-mvn-wrapper.outputs.cache-hit == 'true' && 'HIT' || 'WARMED' }}"
+              echo "  Maven repo    : ${{ steps.cache-maven.outputs.cache-hit == 'true' && 'HIT' || 'WARMED' }}"
+              ;;
+            python)
+              echo "  pip cache     : ${{ steps.cache-pip.outputs.cache-hit == 'true' && 'HIT' || 'WARMED' }}"
+              echo "  venv          : ${{ steps.cache-venv.outputs.cache-hit == 'true' && 'HIT' || 'WARMED' }}"
+              ;;
+            javascript)
+              PM="${{ steps.js-detect.outputs.pm }}"
+              E2E="${{ steps.js-detect.outputs.e2e }}"
+              echo "  Package Mgr   : $PM"
+              echo "  npm cache     : ${{ steps.cache-npm.outputs.cache-hit == 'true' && 'HIT' || (steps.js-detect.outputs.pm == 'npm' && 'WARMED' || 'SKIP') }}"
+              echo "  yarn cache    : ${{ steps.cache-yarn.outputs.cache-hit == 'true' && 'HIT' || (steps.js-detect.outputs.pm == 'yarn' && 'WARMED' || 'SKIP') }}"
+              echo "  pnpm cache    : ${{ steps.cache-pnpm.outputs.cache-hit == 'true' && 'HIT' || (steps.js-detect.outputs.pm == 'pnpm' && 'WARMED' || 'SKIP') }}"
+              echo "  bun cache     : ${{ steps.cache-bun.outputs.cache-hit == 'true' && 'HIT' || (steps.js-detect.outputs.pm == 'bun' && 'WARMED' || 'SKIP') }}"
+              echo "  Playwright    : ${{ steps.cache-playwright.outputs.cache-hit == 'true' && 'HIT' || (steps.js-detect.outputs.e2e == 'playwright' && 'WARMED' || 'SKIP') }}"
+              echo "  Cypress       : ${{ steps.cache-cypress.outputs.cache-hit == 'true' && 'HIT' || (steps.js-detect.outputs.e2e == 'cypress' && 'WARMED' || 'SKIP') }}"
+              ;;
+            devops)
+              echo "  pip (yamllint): WARMED"
+              echo "  Terraform     : ${{ steps.cache-terraform.outputs.cache-hit == 'true' && 'HIT' || (steps.devops-detect.outputs.has_terraform == 'true' && 'WARMED' || 'SKIP — no .tf files') }}"
+              echo "  TFLint        : ${{ steps.cache-tflint.outputs.cache-hit == 'true' && 'HIT' || (steps.devops-detect.outputs.has_terraform == 'true' && 'WARMED' || 'SKIP — no .tf files') }}"
+              echo "  Helm          : ${{ steps.cache-helm.outputs.cache-hit == 'true' && 'HIT' || (steps.devops-detect.outputs.has_helm == 'true' && 'WARMED' || 'SKIP — no Chart.yaml') }}"
+              ;;
+          esac
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

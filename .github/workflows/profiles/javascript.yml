@@ -1,0 +1,564 @@
+# profiles/javascript.yml — Reusable CI pipeline for JavaScript/Node.js apprenticeship repos.
+# Handles plain JavaScript, React, Next.js, Angular, Vue, Nuxt, and Remix from a single
+# profile — apprentices only need to set `profile: javascript` in ci-profile.yml.
+# Triggered via workflow_call from pipeline.yml or directly from a lab repo.
+#
+# Step order rationale
+# ─────────────────────────────────────────────────────────────────────────────
+#  1. checkout              – source must exist before any detection or install
+#  2. setup-node            – toolchain must exist before npm/pnpm/yarn/bun run
+#  3. detect tooling        – all framework/PM/test-runner detection in one step;
+#                             every subsequent conditional reads steps.detect.outputs
+#  4. setup PM extras       – pnpm/yarn/bun global install happens after detection
+#  5. restore dep cache     – PM-specific path cached before install to avoid re-download
+#  6. restore E2E cache     – browser binaries cached before E2E install check
+#  7. install dependencies  – frozen install after cache is ready; validates lock file
+#  8. install E2E binaries  – conditional on cache miss; only if E2E was in package.json
+#  9. TypeScript check      – type check before lint/build so the most specific error
+#                             surfaces first; failure stops the pipeline
+# 10. lint                  – static analysis after types pass; failure stops pipeline
+# 11. build                 – framework build after source is clean; failure stops pipeline
+# 12. test                  – run test suite after clean build; generates coverage report
+# 13. trivy scan            – CVE scan after build artifacts exist; failure stops upload
+# 14. upload artifacts      – persist build output and coverage; runs even on failure
+# 15. detection summary     – always-run diagnostic showing what was detected
+
+name: JavaScript CI
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: "Node.js version to use (e.g. 20, 22)"
+        required: false
+        type: string
+        default: "20"
+      package_manager:
+        description: "Package manager override: npm | yarn | pnpm | bun | auto"
+        required: false
+        type: string
+        default: "auto"
+      framework:
+        description: "Framework override: nextjs | angular | remix | nuxt | vue | react | vanilla | auto"
+        required: false
+        type: string
+        default: "auto"
+      trivy-severity:
+        description: "Comma-separated Trivy severity levels that fail the build"
+        required: false
+        type: string
+        default: "CRITICAL,HIGH"
+    secrets:
+      SONAR_TOKEN:
+        required: false
+
+jobs:
+  build-and-test:
+    name: Detect → Lint → Build → Test → Scan → Upload
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      # Must be the very first step so every subsequent step has access to the
+      # full source tree, package.json, lock files, and config files.
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Node.js ──────────────────────────────────────────────────
+      # Installs the requested Node.js version. The cache option is intentionally
+      # omitted here because caching is handled manually in Step 5 so it can be
+      # conditional on the package manager detected in Step 3.
+      - name: Set up Node.js ${{ inputs.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      # ── 3. Detect tooling ──────────────────────────────────────────────────
+      # Single bash step that detects package manager, framework, build tool,
+      # test runner, TypeScript presence, E2E tool, and ESLint config in one
+      # pass. All outputs are written to GITHUB_OUTPUT and every conditional
+      # step below reads from steps.detect.outputs.* — never re-detecting.
+      # Centralising detection here avoids redundant filesystem reads and makes
+      # the logic easy to debug: the Detection Summary (Step 15) shows every
+      # value that was resolved.
+      - name: Detect tooling (package manager, framework, test runner, E2E, TypeScript, ESLint)
+        id: detect
+        run: |
+          # ── Package manager ────────────────────────────────────────────────
+          # pnpm and yarn are checked before npm because npm can leave behind
+          # package-lock.json even in projects that primarily use another manager;
+          # checking specific lock files first avoids false positives.
+          if [[ "${{ inputs.package_manager }}" != "auto" ]]; then
+            PM="${{ inputs.package_manager }}"
+          elif [[ -f pnpm-lock.yaml ]]; then
+            PM=pnpm
+          elif [[ -f yarn.lock ]]; then
+            PM=yarn
+          elif [[ -f bun.lockb ]]; then
+            PM=bun
+          else
+            PM=npm
+          fi
+
+          # ── Framework ─────────────────────────────────────────────────────
+          # Read package.json once into $DEPS and reuse it for all subsequent
+          # grep checks — avoids multiple disk reads of the same file.
+          #
+          # next must be checked before react because Next.js projects also have
+          # react as a dependency — checking next first prevents a Next.js app
+          # being misidentified as plain React.
+          if [[ "${{ inputs.framework }}" != "auto" ]]; then
+            FRAMEWORK="${{ inputs.framework }}"
+          else
+            DEPS=$(cat package.json 2>/dev/null || echo "{}")
+            if echo "$DEPS" | grep -q '"next"'; then
+              FRAMEWORK=nextjs
+            elif echo "$DEPS" | grep -q '"@angular/core"'; then
+              FRAMEWORK=angular
+            elif echo "$DEPS" | grep -q '"@remix-run/react"'; then
+              FRAMEWORK=remix
+            elif echo "$DEPS" | grep -q '"nuxt"'; then
+              FRAMEWORK=nuxt
+            elif echo "$DEPS" | grep -q '"vue"'; then
+              FRAMEWORK=vue
+            elif echo "$DEPS" | grep -q '"react"'; then
+              FRAMEWORK=react
+            else
+              FRAMEWORK=vanilla
+            fi
+          fi
+
+          # Ensure DEPS is populated even when framework was passed as override,
+          # because test runner, E2E, and ESLint detection all need it.
+          DEPS=$(cat package.json 2>/dev/null || echo "{}")
+
+          # ── Build tool ────────────────────────────────────────────────────
+          if [[ -f vite.config.js || -f vite.config.ts ]]; then
+            BUILD_TOOL=vite
+          elif [[ -f next.config.js || -f next.config.ts ]]; then
+            BUILD_TOOL=next
+          elif [[ -f angular.json ]]; then
+            BUILD_TOOL=angular-cli
+          elif [[ -f webpack.config.js ]]; then
+            BUILD_TOOL=webpack
+          else
+            BUILD_TOOL=none
+          fi
+
+          # ── Test runner ───────────────────────────────────────────────────
+          if echo "$DEPS" | grep -q '"vitest"'; then
+            TEST_RUNNER=vitest
+          elif echo "$DEPS" | grep -q '"jest"'; then
+            TEST_RUNNER=jest
+          elif echo "$DEPS" | grep -q '"karma"'; then
+            TEST_RUNNER=karma
+          elif echo "$DEPS" | grep -q '"mocha"'; then
+            TEST_RUNNER=mocha
+          else
+            # Secondary fallback: check the test script value in case the
+            # runner was not listed under dependencies/devDependencies.
+            TEST_SCRIPT=$(grep '"test"' package.json 2>/dev/null | head -1 || true)
+            if echo "$TEST_SCRIPT" | grep -q 'vitest'; then
+              TEST_RUNNER=vitest
+            elif echo "$TEST_SCRIPT" | grep -q 'jest'; then
+              TEST_RUNNER=jest
+            else
+              TEST_RUNNER=none
+            fi
+          fi
+
+          # ── TypeScript ────────────────────────────────────────────────────
+          if [[ -f tsconfig.json ]]; then
+            TYPESCRIPT=true
+          else
+            TYPESCRIPT=false
+          fi
+
+          # ── E2E tool ──────────────────────────────────────────────────────
+          # E2E tools are only detected if they are declared in package.json.
+          # The pipeline never installs Playwright or Cypress on behalf of the
+          # project — if the apprentice has not added them as a dependency they
+          # will not run. This keeps the pipeline honest about what the project
+          # actually tests.
+          if echo "$DEPS" | grep -q '"@playwright/test"'; then
+            E2E=playwright
+          elif echo "$DEPS" | grep -q '"cypress"'; then
+            E2E=cypress
+          else
+            E2E=none
+          fi
+
+          # ── ESLint config ─────────────────────────────────────────────────
+          if [[ -f .eslintrc.js    || -f .eslintrc.ts   || -f .eslintrc.json ||
+                -f .eslintrc.yml   || -f .eslintrc.yaml  || -f .eslintrc      ||
+                $(echo "$DEPS" | grep -c '"eslintConfig"') -gt 0 ]]; then
+            HAS_ESLINT=true
+          else
+            HAS_ESLINT=false
+          fi
+
+          # ── Write all outputs ─────────────────────────────────────────────
+          echo "pm=$PM"                 >> "$GITHUB_OUTPUT"
+          echo "framework=$FRAMEWORK"   >> "$GITHUB_OUTPUT"
+          echo "build_tool=$BUILD_TOOL" >> "$GITHUB_OUTPUT"
+          echo "test_runner=$TEST_RUNNER" >> "$GITHUB_OUTPUT"
+          echo "typescript=$TYPESCRIPT" >> "$GITHUB_OUTPUT"
+          echo "e2e=$E2E"               >> "$GITHUB_OUTPUT"
+          echo "has_eslint=$HAS_ESLINT" >> "$GITHUB_OUTPUT"
+
+      # ── 4. Set up package manager extras ───────────────────────────────────
+      # pnpm, yarn (via corepack), and bun require a global install before they
+      # can execute install or run commands. npm ships with Node.js so it needs
+      # no extra setup. Each step is guarded by an explicit pm check so at most
+      # one of the three runs per workflow invocation.
+
+      - name: Set up pnpm
+        if: steps.detect.outputs.pm == 'pnpm'
+        run: npm install -g pnpm
+
+      - name: Set up yarn (corepack)
+        if: steps.detect.outputs.pm == 'yarn'
+        run: corepack enable
+
+      - name: Set up bun
+        if: steps.detect.outputs.pm == 'bun'
+        run: npm install -g bun
+
+      # ── 5. Restore dependency cache ────────────────────────────────────────
+      # One cache step per package manager, each conditionally activated.
+      # The cache key is based on the lock file hash so the cache invalidates
+      # automatically whenever dependencies change. The restore-key fallback
+      # restores the closest available cache when the exact key is not found,
+      # for example after adding a new package — only the delta is downloaded.
+
+      - name: Restore npm cache
+        if: steps.detect.outputs.pm == 'npm'
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-npm-
+
+      - name: Restore yarn cache
+        if: steps.detect.outputs.pm == 'yarn'
+        uses: actions/cache@v4
+        with:
+          path: ~/.yarn/cache
+          key: ${{ runner.os }}-yarn-${{ hashFiles('yarn.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+
+      - name: Restore pnpm store cache
+        if: steps.detect.outputs.pm == 'pnpm'
+        uses: actions/cache@v4
+        with:
+          path: ~/.pnpm-store
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-
+
+      - name: Restore bun cache
+        if: steps.detect.outputs.pm == 'bun'
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('bun.lockb') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+
+      # ── 6. Restore E2E browser cache ───────────────────────────────────────
+      # Browser binaries are large (Chromium ~300 MB, Cypress binary ~800 MB)
+      # and should be cached independently of node_modules. Each step only
+      # activates when the corresponding E2E tool was found in package.json.
+
+      # Playwright stores downloaded binaries at ~/.cache/ms-playwright.
+      # Chromium alone is around 300 MB. The cache key is based on the lock
+      # file so it only invalidates when the Playwright version itself changes,
+      # not on every unrelated dependency update. This step only runs because
+      # @playwright/test was found in the project's own package.json.
+      - name: Restore Playwright browser cache
+        if: steps.detect.outputs.e2e == 'playwright'
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('package-lock.json', 'yarn.lock', 'pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-playwright-
+
+      # Cypress stores its binary separately from node_modules at ~/.cache/Cypress.
+      # Without caching this path the full Cypress binary (~800 MB) would download
+      # on every run even when node_modules is fully cached. node_modules/.cache/cypress
+      # is also included for the per-project metadata Cypress writes there.
+      # This step only runs because cypress was found in the project's own package.json.
+      - name: Restore Cypress browser cache
+        if: steps.detect.outputs.e2e == 'cypress'
+        id: cypress-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/Cypress
+            node_modules/.cache/cypress
+          key: ${{ runner.os }}-cypress-${{ hashFiles('package-lock.json', 'yarn.lock', 'pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-cypress-
+
+      # ── 7. Install dependencies ────────────────────────────────────────────
+      # All four commands use frozen/ci mode which installs exactly what is in
+      # the lock file and fails if the lock file is out of sync with package.json.
+      # This catches apprentices who edited package.json without running install.
+      # This step installs everything declared in package.json including Playwright
+      # and Cypress if they are listed — no additional install commands are needed
+      # for E2E tools at this point.
+      - name: Install dependencies
+        run: |
+          case "${{ steps.detect.outputs.pm }}" in
+            npm)  npm ci ;;
+            yarn) yarn install --frozen-lockfile ;;
+            pnpm) pnpm install --frozen-lockfile ;;
+            bun)  bun install --frozen-lockfile ;;
+          esac
+
+      # ── 8. Install E2E browser binaries (cache miss only) ─────────────────
+      # Browser binary installation is conditional on both the E2E detection
+      # from Step 3 AND a cache miss from Step 6. If the cache was restored the
+      # binary directory already exists and we skip the download entirely.
+      #
+      # IMPORTANT: these steps only run if the E2E tool was detected in the
+      # project's own package.json in Step 3 — the pipeline never installs
+      # Playwright or Cypress on behalf of a project that has not declared them.
+
+      # npx playwright install reads the Playwright version from the project's
+      # own node_modules and installs only the Chromium binary declared by that
+      # version — not Firefox or WebKit. The binary version is always in sync
+      # with @playwright/test in package.json because npx resolves from node_modules.
+      - name: Install Playwright Chromium binary (cache miss)
+        if: steps.detect.outputs.e2e == 'playwright'
+        run: |
+          if [ ! -d "$HOME/.cache/ms-playwright/chromium-"* ] 2>/dev/null; then
+            echo "Cache miss — installing Playwright Chromium from package"
+            npx playwright install chromium --with-deps
+          else
+            echo "Cache hit — Playwright Chromium already present, skipping install"
+          fi
+
+      # npx cypress install reads the Cypress version from the project's own
+      # node_modules and installs the matching binary. The version always matches
+      # the cypress package in package.json because npx resolves from node_modules.
+      - name: Install Cypress binary (cache miss)
+        if: steps.detect.outputs.e2e == 'cypress'
+        run: |
+          if [ ! -d "$HOME/.cache/Cypress" ]; then
+            echo "Cache miss — installing Cypress binary from package"
+            npx cypress install
+          else
+            echo "Cache hit — Cypress binary already present, skipping install"
+          fi
+
+      # ── 9. TypeScript check ────────────────────────────────────────────────
+      # --noEmit checks all types without writing output files — pure type
+      # validation. Positioned before lint and build so apprentices see the most
+      # specific error first rather than a cascade of downstream failures caused
+      # by a type error. TypeScript is resolved from node_modules so the version
+      # always matches what the project declared. Failure stops the pipeline —
+      # continue-on-error is intentionally absent.
+      - name: TypeScript type check
+        if: steps.detect.outputs.typescript == 'true'
+        run: npx tsc --noEmit
+
+      # ── 10. Lint ───────────────────────────────────────────────────────────
+      # Lint runs after types pass. Angular uses its own lint command which
+      # internally calls ESLint with Angular-specific rules from angular.json —
+      # running npx eslint directly would bypass those rules. All other
+      # frameworks use ESLint if a config was detected. If no ESLint config
+      # exists the step prints a notice; this is a skip not a failure because
+      # early-stage labs may not have ESLint configured yet.
+      - name: Lint
+        run: |
+          case "${{ steps.detect.outputs.framework }}" in
+            angular)
+              # Angular uses its own lint command which internally calls ESLint
+              # with Angular-specific rules configured in angular.json — running
+              # npx eslint directly would miss these rules.
+              npx ng lint
+              ;;
+            *)
+              if [[ "${{ steps.detect.outputs.has_eslint }}" == "true" ]]; then
+                # ESLint is resolved from node_modules so the version and plugins
+                # are always what the project declared in package.json — no
+                # global ESLint is used.
+                npx eslint . --ext .js,.jsx,.ts,.tsx
+              else
+                # Some early-stage lab repos may not have ESLint configured yet —
+                # skipping is intentional here rather than failing. The detection
+                # summary (Step 15) will show has_eslint=false so the apprentice
+                # knows linting did not run.
+                echo "No ESLint config found in this project, skipping lint"
+              fi
+              ;;
+          esac
+        continue-on-error: ${{ steps.detect.outputs.has_eslint == 'false' && steps.detect.outputs.framework != 'angular' }}
+
+      # ── 11. Build ──────────────────────────────────────────────────────────
+      # Build commands use the detected package manager via $PM so no hardcoded
+      # npm calls appear anywhere in this step. Each framework has its own build
+      # logic — see inline comments. Failure stops the pipeline.
+      - name: Build
+        run: |
+          PM="${{ steps.detect.outputs.pm }}"
+
+          case "${{ steps.detect.outputs.framework }}" in
+            nextjs)
+              # Next.js production build validates SSR, static generation, and
+              # catches missing environment variables and import errors that only
+              # surface at build time — running in development mode would miss these.
+              NODE_ENV=production $PM run build
+              ;;
+            angular)
+              # Angular production build enables stricter checks and optimisations
+              # not present in development mode — using npx ng ensures the Angular
+              # CLI version from node_modules is used, not a globally installed one.
+              npx ng build --configuration production
+              ;;
+            vue|nuxt|remix)
+              # Build validates that all imports resolve and the bundler can process
+              # all source files — the bundler (Vite, Nuxt build, Remix compiler)
+              # is resolved from node_modules.
+              $PM run build
+              ;;
+            react)
+              # Plain React projects without a bundler configured may not have a
+              # build script — Create React App and Vite-based React projects will
+              # have one, bare React projects may not. Check before running.
+              if grep -q '"build"' package.json 2>/dev/null; then
+                $PM run build
+              else
+                echo "No build script found in package.json for React project — skipping"
+              fi
+              ;;
+            vanilla)
+              # Vanilla JavaScript has no compilation or bundling step — linting
+              # and tests are sufficient for validation.
+              echo "Vanilla JavaScript project — no build step required"
+              ;;
+          esac
+
+      # ── 12. Test ───────────────────────────────────────────────────────────
+      # All test runner binaries are resolved via npx from node_modules — no
+      # globally installed runners are used. Coverage reports are generated where
+      # supported for downstream SonarQube consumption. If no test runner was
+      # detected the step prints a notice rather than failing, because early-stage
+      # labs may not have tests yet.
+      - name: Test
+        run: |
+          case "${{ steps.detect.outputs.test_runner }}" in
+            jest)
+              # --passWithNoTests prevents failure on repos where apprentices have
+              # not written tests yet. --ci disables interactive watch mode and
+              # treats warnings as errors. Coverage report is generated for SonarQube.
+              npx jest --coverage --passWithNoTests --ci
+              ;;
+            vitest)
+              # run flag executes tests once and exits rather than watching —
+              # required in CI. vitest is resolved from node_modules so the version
+              # matches what the project declared.
+              npx vitest run --coverage
+              ;;
+            karma)
+              # single-run exits after tests complete; ChromeHeadless is required
+              # in CI because there is no display. karma is resolved from node_modules.
+              npx karma start --single-run --browsers ChromeHeadless
+              ;;
+            mocha)
+              # mocha is resolved from node_modules.
+              npx mocha --recursive
+              ;;
+            playwright)
+              # Playwright is resolved from node_modules and uses the project's own
+              # playwright.config file — browser binaries were installed in Step 8
+              # from the project's own declared version.
+              npx playwright test
+              ;;
+            cypress)
+              # Headless mode required in CI. Cypress is resolved from node_modules
+              # and uses the project's own cypress.config file — binary was installed
+              # in Step 8 from the project's own declared version.
+              npx cypress run --headless
+              ;;
+            none)
+              # The detection summary (Step 15) will show test_runner=none so the
+              # apprentice can see clearly that no tests ran — this is a warning not
+              # a failure since early-stage labs may not have tests yet.
+              echo "No test runner found in this project's dependencies"
+              ;;
+          esac
+        continue-on-error: ${{ steps.detect.outputs.test_runner == 'none' }}
+
+      # ── 13. Trivy dependency CVE scan ─────────────────────────────────────
+      # - Trivy scans the lock file (package-lock.json, yarn.lock, or
+      #   pnpm-lock.yaml) — node_modules is intentionally skipped via skip-dirs
+      #   and this is not a gap because the lock file contains the full resolved
+      #   dependency graph including transitive packages
+      # - Trivy uses NVD, GitHub Advisory, and OSV databases, giving broader
+      #   coverage than npm audit alone
+      # - exit-code 1 fails the pipeline so apprentices must address
+      #   vulnerabilities before merging — this is intentional
+      # - vuln-type library limits the scan to application dependencies and
+      #   excludes OS-level package CVEs which are not relevant here
+      # - CRITICAL and HIGH are flagged — MEDIUM and LOW are intentionally
+      #   excluded to avoid overwhelming apprentices with noise
+      - name: Trivy — JavaScript dependency CVE scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: table
+          severity: ${{ inputs.trivy-severity }}
+          exit-code: "1"
+          vuln-type: library
+          scanners: vuln
+          skip-dirs: "node_modules,.next,dist,build,.nuxt,out"
+
+      # ── 14. Upload artifacts ───────────────────────────────────────────────
+      # if-no-files-found warn rather than error because not all frameworks
+      # produce all output paths — a vanilla JS project will not have a dist/
+      # folder and that is expected. if: always() ensures artifacts upload even
+      # when tests or Trivy failed so SonarQube can still run and apprentices
+      # can inspect their coverage report regardless of pipeline outcome.
+      - name: Upload build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: js-build
+          if-no-files-found: warn
+          path: |
+            coverage/
+            coverage-report/
+            .next/analyze/
+            dist/
+            build/
+            .nuxt/
+
+      # ── 15. Detection summary ──────────────────────────────────────────────
+      # Always-run diagnostic step that prints every value resolved by Step 3.
+      # This summary is the first thing to check when a pipeline behaves
+      # unexpectedly. If the wrong framework was detected the apprentice can
+      # override it in ci-profile.yml using the framework input. If e2e shows
+      # none but the project has Playwright or Cypress it means they are not
+      # declared in package.json.
+      - name: Print detection summary
+        if: always()
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  CI Pipeline Detection Summary"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  Framework    : ${{ steps.detect.outputs.framework }}"
+          echo "  Package Mgr  : ${{ steps.detect.outputs.pm }}"
+          echo "  Build Tool   : ${{ steps.detect.outputs.build_tool }}"
+          echo "  Test Runner  : ${{ steps.detect.outputs.test_runner }}"
+          echo "  TypeScript   : ${{ steps.detect.outputs.typescript }}"
+          echo "  E2E          : ${{ steps.detect.outputs.e2e }}"
+          echo "  ESLint       : ${{ steps.detect.outputs.has_eslint }}"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

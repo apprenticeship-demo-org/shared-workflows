@@ -1,0 +1,153 @@
+# pipeline.yml — Central orchestrator workflow.
+# Reads ci-profile.yml from the calling repo, warms the dependency cache,
+# delegates to the matching profile workflow, then runs shared security and
+# quality gates that apply to every profile.
+
+name: CI Pipeline
+
+on:
+  workflow_call:
+    inputs:
+      # ── Runtime version overrides (all optional; defaults live in each profile) ──
+      java-version:
+        description: "Java version override (default: 21)"
+        required: false
+        type: string
+        default: "21"
+      python-version:
+        description: "Python version override (default: 3.12)"
+        required: false
+        type: string
+        default: "3.12"
+      node-version:
+        description: "Node.js version override (default: 20)"
+        required: false
+        type: string
+        default: "20"
+      dockerfile-path:
+        description: "Path to Dockerfile (default: Dockerfile)"
+        required: false
+        type: string
+        default: "Dockerfile"
+      terraform-version:
+        description: "Terraform version override (default: latest)"
+        required: false
+        type: string
+        default: "latest"
+      # ── Quality gate overrides ────────────────────────────────────────────
+      sonar-project-key:
+        description: "SonarQube / SonarCloud project key (falls back to repo name)"
+        required: false
+        type: string
+        default: ""
+    secrets:
+      SONAR_TOKEN:
+        required: false
+
+jobs:
+
+  # ── 1. Detect profile ──────────────────────────────────────────────────────
+  read-profile:
+    name: Detect CI profile
+    runs-on: ubuntu-latest
+    outputs:
+      profile: ${{ steps.extract.outputs.profile }}
+    steps:
+      - name: Checkout calling repository
+        uses: actions/checkout@v4
+
+      - name: Extract profile from ci-profile.yml
+        id: extract
+        run: |
+          if [[ ! -f ci-profile.yml ]]; then
+            echo "::error::ci-profile.yml not found in repository root."
+            exit 1
+          fi
+          PROFILE=$(grep -oP '(?<=^profile:\s)[\w]+' ci-profile.yml || true)
+          if [[ -z "$PROFILE" ]]; then
+            echo "::error::Could not extract 'profile' field from ci-profile.yml."
+            exit 1
+          fi
+          echo "Detected profile: $PROFILE"
+          echo "profile=$PROFILE" >> "$GITHUB_OUTPUT"
+
+  # ── 2. Warm dependency cache ───────────────────────────────────────────────
+  cache-warmer:
+    name: Warm cache (${{ needs.read-profile.outputs.profile }})
+    needs: [read-profile]
+    uses: ./.github/workflows/shared/cache-warmer.yml
+    with:
+      profile:           ${{ needs.read-profile.outputs.profile }}
+      java-version:      ${{ inputs.java-version }}
+      python-version:    ${{ inputs.python-version }}
+      node-version:      ${{ inputs.node-version }}
+      terraform-version: ${{ inputs.terraform-version }}
+    secrets: inherit
+
+  # ── 3. Profile jobs ────────────────────────────────────────────────────────
+  java:
+    name: Java profile
+    needs: [read-profile, cache-warmer]
+    if: needs.read-profile.outputs.profile == 'java'
+    uses: ./.github/workflows/profiles/java.yml
+    with:
+      java-version: ${{ inputs.java-version }}
+    secrets: inherit
+
+  python:
+    name: Python profile
+    needs: [read-profile, cache-warmer]
+    if: needs.read-profile.outputs.profile == 'python'
+    uses: ./.github/workflows/profiles/python.yml
+    with:
+      python-version: ${{ inputs.python-version }}
+    secrets: inherit
+
+  javascript:
+    name: JavaScript profile
+    needs: [read-profile, cache-warmer]
+    if: needs.read-profile.outputs.profile == 'javascript'
+    uses: ./.github/workflows/profiles/javascript.yml
+    with:
+      node-version: ${{ inputs.node-version }}
+    secrets: inherit
+
+  devops:
+    name: DevOps profile
+    needs: [read-profile, cache-warmer]
+    if: needs.read-profile.outputs.profile == 'devops'
+    uses: ./.github/workflows/profiles/devops.yml
+    with:
+      dockerfile-path:    ${{ inputs.dockerfile-path }}
+      terraform-version:  ${{ inputs.terraform-version }}
+    secrets: inherit
+
+  # ── 4. Shared gates (run after whichever profile job executed) ─────────────
+  #  * needs includes read-profile so we can reference its outputs here.
+  #  * always() + !failure() + !cancelled() = run even when sibling profile
+  #    jobs were skipped, but abort on real failures or cancellations.
+
+  trivy:
+    name: Trivy SARIF → Security tab
+    needs: [read-profile, java, python, javascript, devops]
+    if: always() && !failure() && !cancelled()
+    uses: ./.github/workflows/shared/trivy.yml
+    with:
+      profile: ${{ needs.read-profile.outputs.profile }}
+    secrets: inherit
+
+  sonarqube:
+    name: SonarQube analysis
+    needs: [read-profile, java, python, javascript, devops]
+    if: always() && !failure() && !cancelled()
+    uses: ./.github/workflows/shared/sonarqube.yml
+    with:
+      project-key: ${{ inputs.sonar-project-key }}
+    secrets: inherit
+
+  copilot-review:
+    name: Copilot PR review
+    needs: [read-profile, java, python, javascript, devops]
+    if: always() && !failure() && !cancelled() && github.event_name == 'pull_request'
+    uses: ./.github/workflows/shared/copilot-review.yml
+    secrets: inherit

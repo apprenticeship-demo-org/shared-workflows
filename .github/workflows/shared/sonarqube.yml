@@ -1,0 +1,164 @@
+# shared/sonarqube.yml — Reusable SonarQube / SonarCloud code quality workflow.
+#
+# ── Why fetch-depth: 0 ────────────────────────────────────────────────────────
+# By default actions/checkout performs a shallow clone (depth 1) which gives
+# SonarQube only the latest commit. SonarQube needs the full git history to:
+#   • calculate "new code" correctly on PR analysis (blame data)
+#   • compute accurate "lines added since reference branch" metrics
+#   • track issue age and first-introduction commit for each finding
+# Without full history every finding appears as "new" and blame-based metrics
+# are wrong. fetch-depth: 0 fetches all branches and all commits.
+#
+# ── Dynamic project key ───────────────────────────────────────────────────────
+# sonar.projectKey is set to  <org>_<repo>  (e.g. my-org_java-lab-01).
+# This means every lab repo self-registers in SonarQube on its first run
+# without any manual project creation in the UI. The underscore separator is
+# the SonarQube convention for org-scoped keys. The same key is used
+# consistently across branches and PRs so history accumulates in one place.
+# Override via the project-key input if the repo needs a custom key.
+#
+# ── Artifact pattern '*-build' ────────────────────────────────────────────────
+# Each profile uploads artifacts under a profile-specific name:
+#   java-build       → target/ + target/site/jacoco/jacoco.xml
+#   python-build     → coverage.xml
+#   js-build         → coverage/ + dist/ + build/ etc.
+#   devops-build     → .tf, Dockerfile, .yml, Jenkinsfile
+# The pattern '*-build' matches whichever of these was produced so this
+# workflow does not need to know which profile ran. merge-multiple: true
+# flattens all matched artifacts into the working directory so SonarQube's
+# scanner finds coverage reports at the paths it expects.
+#
+# ── Quality gate polling ──────────────────────────────────────────────────────
+# sonarqube-scan-action submits the analysis and returns immediately.
+# sonarqube-quality-gate-action polls the SonarQube server until the
+# background analysis task completes and the gate result is available,
+# then fails the step if the gate is RED. timeout-minutes: 5 prevents
+# the job hanging indefinitely if the server is slow or unreachable.
+
+name: SonarQube Analysis
+
+on:
+  workflow_call:
+    inputs:
+      sonar-host-url:
+        description: "SonarQube server URL. Leave empty to use SonarCloud."
+        required: false
+        type: string
+        default: "https://sonarcloud.io"
+      project-key:
+        description: >
+          SonarQube project key override. When empty (default) the key is
+          derived automatically as  <github.repository_owner>_<repo.name>
+          so every lab repo self-registers without manual SonarQube setup.
+        required: false
+        type: string
+        default: ""
+    secrets:
+      SONAR_TOKEN:
+        required: false
+      SONAR_HOST_URL:
+        description: "Alternative way to supply the SonarQube host URL as a secret."
+        required: false
+
+jobs:
+  sonarqube:
+    name: SonarQube analysis & quality gate
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # ── 1. Checkout with full history ──────────────────────────────────────
+      # fetch-depth: 0 fetches all commits and all branches. Required for
+      # accurate new-code detection, blame data, and PR differential analysis.
+      # See header comment for full rationale.
+      - name: Checkout repository (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ── 2. Download build artifacts from the profile job ──────────────────
+      # The pattern '*-build' matches java-build, python-build, js-build, and
+      # devops-build so this step works regardless of which profile ran.
+      # merge-multiple: true unpacks all matched artifacts into the current
+      # working directory, preserving relative paths. SonarQube will then find:
+      #   • jacoco.xml   at target/site/jacoco/jacoco.xml  (Java)
+      #   • coverage.xml at ./coverage.xml                 (Python)
+      #   • lcov.info    at coverage/lcov.info             (JavaScript/Vitest)
+      # If no artifact was uploaded (e.g. the profile job failed before upload)
+      # the step exits 0 so SonarQube still runs and reports what it can.
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "*-build"
+          merge-multiple: true
+        continue-on-error: true
+
+      # ── 3. Resolve project key ─────────────────────────────────────────────
+      # If the caller supplied an explicit project-key input use it verbatim.
+      # Otherwise derive  <owner>_<repo>  from GitHub context. This is done in
+      # a shell step so the value is available to the scanner via GITHUB_OUTPUT.
+      - name: Resolve SonarQube project key
+        id: sonar-key
+        run: |
+          if [[ -n "${{ inputs.project-key }}" ]]; then
+            KEY="${{ inputs.project-key }}"
+            echo "Using explicit project key: $KEY"
+          else
+            # GitHub provides repository as "owner/repo"; replace / with _
+            # to produce the SonarQube convention "owner_repo".
+            KEY="${{ github.repository_owner }}_${{ github.event.repository.name }}"
+            echo "Derived project key: $KEY"
+          fi
+          echo "key=$KEY" >> "$GITHUB_OUTPUT"
+
+      # ── 4. SonarQube scan ─────────────────────────────────────────────────
+      # Submits source and analysis metadata to the SonarQube server.
+      # The scan runs asynchronously on the server — this step returns as soon
+      # as the task is queued. The quality gate step (below) polls for the
+      # result. SONAR_HOST_URL is read from the secret if set, otherwise falls
+      # back to the input so both configuration styles work.
+      - name: SonarQube scan
+        uses: SonarSource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL || inputs.sonar-host-url }}
+        with:
+          args: >
+            -Dsonar.projectKey=${{ steps.sonar-key.outputs.key }}
+            -Dsonar.projectName=${{ github.event.repository.name }}
+            -Dsonar.sources=.
+            -Dsonar.scm.provider=git
+
+      # ── 5. Quality gate check ──────────────────────────────────────────────
+      # Polls the SonarQube server until the background analysis task that was
+      # submitted in step 4 finishes and the quality gate result is published.
+      # Fails this step (and therefore the pipeline) if the gate is RED.
+      # timeout-minutes: 5 prevents an indefinite hang if the server is slow.
+      # if: always() ensures this step runs even if the scan step hit a
+      # transient error, so the quality gate result is always reported when
+      # available.
+      - name: SonarQube quality gate check
+        id: quality-gate
+        if: always()
+        uses: SonarSource/sonarqube-quality-gate-action@master
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL || inputs.sonar-host-url }}
+
+      # ── 6. Quality gate summary ────────────────────────────────────────────
+      # Prints the gate status to the log so it is visible without navigating
+      # to the SonarQube UI. A RED gate will have already failed step 5;
+      # this step is informational only. if: always() runs it on success and
+      # failure so the status is always visible in the job summary.
+      - name: Quality gate summary
+        if: always()
+        run: |
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  SonarQube Analysis Summary"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  Project key  : ${{ steps.sonar-key.outputs.key }}"
+          echo "  Project name : ${{ github.event.repository.name }}"
+          echo "  SonarQube    : ${{ secrets.SONAR_HOST_URL || inputs.sonar-host-url }}"
+          echo "  Quality gate : ${{ steps.quality-gate.outputs.quality-gate-status }}"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

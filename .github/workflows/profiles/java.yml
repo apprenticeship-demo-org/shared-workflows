@@ -1,0 +1,151 @@
+# profiles/java.yml — Reusable CI pipeline for Java apprenticeship repos.
+# Triggered via workflow_call from pipeline.yml or directly from a lab repo.
+#
+# Step order rationale
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. checkout          – source must be present before anything else runs
+# 2. setup-java        – toolchain must exist before Maven is invoked
+# 3. restore-maven-wrapper-cache  – lightweight; avoids re-downloading wrapper
+# 4. restore-maven-repo-cache     – heaviest cache; restores ~.m2/repository
+# 5. lint (checkstyle) – fast static gate; fail early before a full build
+# 6. build & test      – mvn verify compiles, runs tests, generates JaCoCo
+# 7. prune snapshots   – evict volatile SNAPSHOT jars before the cache is saved
+# 8. trivy scan        – dependency CVE scan after artifact production,
+#                        before upload so a critical finding blocks the upload
+# 9. upload-artifact   – persists binaries and coverage report for downstream
+
+name: Java CI
+
+on:
+  workflow_call:
+    inputs:
+      java-version:
+        description: "JDK version to use (e.g. 17, 21)"
+        required: false
+        type: string
+        default: "21"
+      trivy-severity:
+        description: "Comma-separated Trivy severity levels that fail the build"
+        required: false
+        type: string
+        default: "CRITICAL,HIGH"
+    secrets:
+      SONAR_TOKEN:
+        required: false
+
+jobs:
+  build:
+    name: Lint → Build & Test → Scan → Upload
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      # Must be the very first step so every subsequent step has access to the
+      # repository source tree, pom.xml files, and the Maven wrapper script.
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Java ─────────────────────────────────────────────────────
+      # Install the requested JDK with the Eclipse Temurin distribution before
+      # any Maven command runs. setup-java@v4 also writes a .mvn/jvm.config so
+      # the Maven wrapper inherits the correct JAVA_HOME automatically.
+      - name: Set up JDK ${{ inputs.java-version }} (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ inputs.java-version }}
+          distribution: temurin
+
+      # ── 3. Restore Maven wrapper cache ─────────────────────────────────────
+      # The Maven wrapper downloads a specific Maven version into
+      # .mvn/wrapper/dists on first use. Caching it avoids a ~10 MB download
+      # on every run. Placed before any mvn call so the wrapper binary is
+      # already present when Checkstyle runs.
+      - name: Restore Maven wrapper cache
+        uses: actions/cache@v4
+        with:
+          path: .mvn/wrapper
+          key: ${{ runner.os }}-mvn-wrapper-${{ hashFiles('.mvn/wrapper/maven-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-mvn-wrapper-
+
+      # ── 4. Restore Maven local repository cache ─────────────────────────────
+      # ~/.m2/repository holds all downloaded JARs (Spring Boot, JUnit 5,
+      # Mockito, Lombok, SLF4J, Jackson, Hibernate, …). Restoring it before the
+      # build means Maven resolves dependencies from disk rather than the network.
+      #
+      # Two-level key strategy:
+      #   Primary  – OS + "maven" + hash of every pom.xml (exact match: cache is
+      #              valid only if no dependency has changed)
+      #   Fallback – OS + "maven" (partial match: restores the nearest cache so
+      #              only the changed/new dependencies are downloaded)
+      - name: Restore Maven repository cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+
+      # ── 5. Lint (Checkstyle) ───────────────────────────────────────────────
+      # Run Checkstyle before compiling so style violations are caught as early
+      # as possible without paying the cost of a full compilation. The step is
+      # intentionally placed here so a style failure stops the pipeline before
+      # any compute-intensive work (compilation, test execution) starts.
+      - name: Lint — Checkstyle
+        run: ./mvnw --batch-mode --no-transfer-progress checkstyle:check
+
+      # ── 6. Build and test (mvn verify) ─────────────────────────────────────
+      # mvn verify runs the full lifecycle: compile → test → package → verify.
+      # It also triggers the JaCoCo Maven plugin (configured in pom.xml) to
+      # generate an XML coverage report at target/site/jacoco/jacoco.xml which
+      # is consumed by the SonarQube workflow downstream.
+      - name: Build and test
+        run: ./mvnw --batch-mode --no-transfer-progress verify
+
+      # ── 7. Prune SNAPSHOT dependencies from cache ──────────────────────────
+      # SNAPSHOT artifacts are re-published frequently; caching them causes
+      # stale hit rates and hidden build failures. Deleting them before the
+      # post-job cache-save step ensures only stable release JARs are stored,
+      # keeping the cache clean and small across all lab repos.
+      - name: Prune SNAPSHOT dependencies from Maven cache
+        if: always()
+        run: find ~/.m2/repository -name "*SNAPSHOT*" -delete
+
+      # ── 8. Trivy dependency vulnerability scan ────────────────────────────
+      # Scans the pom.xml dependency tree against the Java-specific CVE database
+      # (ghcr.io/aquasecurity/trivy-java-db) which has far better coverage for
+      # Maven/Gradle artifacts than the generic OSS database. Configured to:
+      #   • scan only library vulnerabilities (not OS packages)
+      #   • skip test class files to avoid false positives on test-only deps
+      #   • fail the pipeline (exit-code: 1) on CRITICAL or HIGH findings
+      # Positioned after the build so Trivy can resolve transitive dependencies
+      # from the fully-resolved classpath, and before artifact upload so a
+      # critical finding blocks the upload of vulnerable binaries.
+      - name: Trivy — Java dependency CVE scan
+        uses: aquasecurity/trivy-action@master
+        env:
+          TRIVY_JAVA_DB_REPOSITORY: ghcr.io/aquasecurity/trivy-java-db
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: table
+          severity: ${{ inputs.trivy-severity }}
+          exit-code: "1"
+          vuln-type: library
+          scanners: vuln
+          skip-files: "**/*Test*.java,**/*Spec*.java"
+
+      # ── 9. Upload build artifacts ──────────────────────────────────────────
+      # Persist the compiled JAR/WAR and the JaCoCo XML report so downstream
+      # jobs (SonarQube analysis, deployment) can download them without
+      # re-running the build. Placed last so a failing Trivy scan prevents
+      # vulnerable artifacts from being uploaded and shared.
+      - name: Upload build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: java-build
+          path: |
+            target/
+            target/site/jacoco/jacoco.xml
+          if-no-files-found: warn

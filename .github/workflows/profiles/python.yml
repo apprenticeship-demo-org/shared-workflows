@@ -1,0 +1,174 @@
+# profiles/python.yml — Reusable CI pipeline for Python apprenticeship repos.
+# Triggered via workflow_call from pipeline.yml or directly from a lab repo.
+#
+# Step order rationale
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. checkout            – source must be present before anything else runs
+# 2. setup-python        – toolchain + built-in pip cache (layer 1 caching)
+# 3. restore-pip-cache   – explicit ~/.cache/pip cache with two-level key
+#                          strategy (layer 2 caching for fine-grained control)
+# 4. restore-venv-cache  – caches .venv if the project uses one; avoids
+#                          recreating the virtual environment on every run
+# 5. pre-warm cache      – installs common packages (pytest, flake8, requests…)
+#                          so most lab repos hit the cache on first run
+# 6. lint (flake8)       – fast static gate; fail early before install + tests
+# 7. install deps        – requirements.txt installed after lint passes
+# 8. trivy scan          – CVE check on installed packages before running tests
+#                          so apprentices get security feedback without waiting
+#                          for the full test suite to complete
+# 9. test (pytest)       – run tests + generate coverage report
+# 10. upload-artifact    – persist coverage.xml for downstream SonarQube job
+
+name: Python CI
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        description: "Python version to use (e.g. 3.11, 3.12)"
+        required: false
+        type: string
+        default: "3.12"
+      trivy-severity:
+        description: "Comma-separated Trivy severity levels that fail the build"
+        required: false
+        type: string
+        default: "CRITICAL,HIGH"
+    secrets:
+      SONAR_TOKEN:
+        required: false
+
+jobs:
+  build:
+    name: Lint → Install → Scan → Test → Upload
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      # Must be the very first step so every subsequent step has access to the
+      # repository source tree, requirements.txt, and any config files.
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Python (with built-in pip cache) ─────────────────────────
+      # Installs the requested Python version and enables setup-python's own
+      # pip cache as the first caching layer. This handles the most common case
+      # automatically and is the fastest path when the default cache key hits.
+      # The explicit cache steps below (layer 2) add finer-grained control.
+      - name: Set up Python ${{ inputs.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: pip
+
+      # ── 3. Restore pip package cache (two-level key) ───────────────────────
+      # Caches the pip download cache at ~/.cache/pip.
+      #
+      # Two-level key strategy:
+      #   Primary  – OS + "pip" + hash(requirements.txt): exact match; cache is
+      #              fully valid only when requirements haven't changed.
+      #   Fallback – OS + "pip": partial match; restores the closest available
+      #              cache so only new/changed packages are downloaded.
+      #
+      # This sits alongside setup-python's built-in cache (step 2) to give full
+      # visibility and control over what is stored and when it is invalidated.
+      - name: Restore pip package cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ inputs.python-version }}-${{ hashFiles('**/requirements*.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-${{ inputs.python-version }}-
+            ${{ runner.os }}-pip-
+
+      # ── 4. Restore virtual environment cache ──────────────────────────────
+      # If the project uses a .venv directory, caching it avoids recreating and
+      # re-populating the virtual environment on every run. Keyed on Python
+      # version + requirements hash so it invalidates when either changes.
+      # Placed before any pip install calls so the restored .venv is ready.
+      - name: Restore virtual environment cache
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: ${{ runner.os }}-venv-${{ inputs.python-version }}-${{ hashFiles('**/requirements*.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-venv-${{ inputs.python-version }}-
+
+      # ── 5. Pre-warm cache with common packages ─────────────────────────────
+      # Installs the most-used packages across apprenticeship lab repos so that
+      # most repos hit the pip cache on their very first run rather than
+      # downloading everything cold. The packages covered are:
+      #   pytest, pytest-cov — test runner and coverage plugin (universal)
+      #   flake8             — linter required by the next step
+      #   requests           — used in almost every HTTP/API lab
+      # Heavier frameworks (Flask, Django, SQLAlchemy, Pydantic, black, mypy)
+      # are intentionally omitted here to keep the pre-warm fast; they will be
+      # cached automatically when a lab's requirements.txt installs them.
+      - name: Pre-warm pip cache with common packages
+        run: pip install --quiet pytest pytest-cov flake8 requests
+
+      # ── 6. Lint (flake8) ───────────────────────────────────────────────────
+      # Run flake8 before installing project dependencies so style violations
+      # are caught as early as possible. A max-line-length of 120 matches the
+      # convention used in apprenticeship labs. Failing here stops the pipeline
+      # before the heavier install + test steps run, saving runner minutes.
+      - name: Lint — flake8
+        run: flake8 . --max-line-length=120 --extend-exclude=.venv,venv,env,.env
+
+      # ── 7. Install project dependencies ───────────────────────────────────
+      # Install from requirements.txt after lint passes. Upgrade pip first to
+      # ensure modern resolver behaviour and avoid legacy warnings in logs.
+      # If no requirements.txt exists the step is skipped gracefully.
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+
+      # ── 8. Trivy Python dependency CVE scan ───────────────────────────────
+      # Scans project dependency manifests (requirements.txt, Pipfile.lock,
+      # poetry.lock, pyproject.toml — detected automatically by Trivy) against
+      # known CVEs in the Python ecosystem.
+      #
+      # Positioned after install but BEFORE running tests so apprentices receive
+      # vulnerability feedback without waiting for the full test suite to finish
+      # against potentially vulnerable code. exit-code: 1 fails the pipeline
+      # immediately on CRITICAL or HIGH findings.
+      #
+      # skip-dirs excludes virtual environment directories (.venv, venv, env,
+      # .env) to prevent Trivy from double-scanning packages that are already
+      # covered via the manifest files.
+      - name: Trivy — Python dependency CVE scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: table
+          severity: ${{ inputs.trivy-severity }}
+          exit-code: "1"
+          vuln-type: library
+          scanners: vuln
+          skip-dirs: ".venv,venv,env,.env"
+
+      # ── 9. Run tests with coverage ─────────────────────────────────────────
+      # Execute the full test suite using pytest. --cov=. measures coverage
+      # across the entire project root; --cov-report=xml writes coverage.xml
+      # which is consumed by the SonarQube workflow downstream.
+      # Tests run after the Trivy scan so vulnerable dependencies are caught
+      # before any test-suite compute is spent on them.
+      - name: Test — pytest with coverage
+        run: pytest --cov=. --cov-report=xml
+
+      # ── 10. Upload build artifacts ─────────────────────────────────────────
+      # Persist the JaCoCo-equivalent coverage.xml so the downstream SonarQube
+      # workflow can import it without re-running the test suite.
+      # if-no-files-found: warn avoids a hard failure if pytest exits before
+      # producing the report (e.g. import errors at collection time).
+      - name: Upload build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-build
+          path: coverage.xml
+          if-no-files-found: warn

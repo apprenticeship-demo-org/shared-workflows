@@ -1,0 +1,12 @@
+# shared/copilot-review.yml — Reusable GitHub Copilot code-review workflow.
+# Posts automated PR review comments powered by GitHub Copilot.
+# Called by profile workflows on pull_request events.
+
+on:
+  workflow_call:
+    inputs:
+      review-level:
+        description: "Review verbosity: summary | detailed"
+        required: false
+        type: string
+        default: "summary"

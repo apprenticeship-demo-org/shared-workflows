@@ -1,0 +1,280 @@
+# shared/trivy.yml — GitHub Security tab SARIF reporting workflow.
+#
+# ── Why this workflow exists separately from the per-profile Trivy scans ──────
+#
+# Each profile workflow (java.yml, python.yml, javascript.yml, devops.yml)
+# already runs its own Trivy step that is tuned for language-specific
+# dependency scanning and will FAIL the pipeline on CRITICAL/HIGH findings.
+# Those per-profile scans use format: table and exit-code: 1 — they are
+# designed to block the merge.
+#
+# This workflow serves a different purpose: it produces a SARIF report and
+# uploads it to the repository's GitHub Security tab (code scanning alerts)
+# so that:
+#   1. Findings are visible as persistent, trackable alerts even after the
+#      pipeline run expires from the Actions log.
+#   2. Instructors and apprentices can see the full vulnerability history
+#      across every branch and PR in one place.
+#   3. The Security tab is updated even when the pipeline-failing scan in the
+#      profile workflow already caused a job failure — because both steps here
+#      use if: always().
+#
+# Separation of concerns:
+#   profile workflow  → table output, exit-code 1, fails the build
+#   this workflow     → SARIF output, exit-code 0, feeds the Security tab
+#
+# The two scans are intentionally independent: one is a hard gate, the other
+# is an audit trail. Combining them would either suppress Security tab alerts
+# on passing builds (too quiet) or double-fail already-blocked pipelines (noisy).
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Trivy — Security Tab Reporting
+
+on:
+  workflow_call:
+    inputs:
+      profile:
+        description: "Tech profile from pipeline.yml: java | python | javascript | devops. Controls scan mode — devops triggers IaC config scan; all others trigger dependency vulnerability scan."
+        required: true
+        type: string
+
+jobs:
+  trivy-sarif:
+    name: Trivy SARIF → Security tab (${{ inputs.profile }})
+    runs-on: ubuntu-latest
+    # Security tab upload requires write permission on security-events.
+    # This is declared here rather than on the workflow_call trigger because
+    # the calling workflow (pipeline.yml) uses secrets: inherit and the
+    # permission must be explicit on the job that performs the upload.
+    permissions:
+      security-events: write
+      contents: read
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Dependency vulnerability scan (all profiles except devops) ─────────
+      # Scans lock files and manifest files for known CVEs in application
+      # libraries. scan-type: fs walks the filesystem and detects the
+      # language-specific manifests automatically (pom.xml, requirements.txt,
+      # package-lock.json, etc.). vuln-type: library excludes OS-level findings
+      # that apprentices cannot fix. format: sarif produces structured output
+      # that the upload-sarif action can ingest. exit-code is deliberately 0
+      # here — this scan must never block the pipeline; that job belongs to
+      # the per-profile Trivy step. if: always() ensures the Security tab is
+      # updated even when the profile job's own Trivy scan already failed.
+      - name: Trivy — dependency CVE scan (SARIF)
+        if: always() && inputs.profile != 'devops'
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln
+          vuln-type: library
+          format: sarif
+          output: trivy-results.sarif
+          exit-code: "0"
+
+      # ── IaC misconfiguration scan (devops profile only) ───────────────────
+      # Scans Terraform, Kubernetes manifests, Helm charts, Dockerfiles, and
+      # other config files for misconfigurations using Trivy's built-in
+      # IaC rules. scan-type: config is the correct mode for static IaC
+      # analysis — it is distinct from the fs vulnerability scan used by other
+      # profiles. skip-dirs excludes .git and node_modules which are never
+      # IaC source files and would generate false-positive findings.
+      # format: sarif and exit-code: 0 apply for the same reasons as above.
+      # if: always() ensures the Security tab is updated even when hadolint or
+      # tflint already failed the devops pipeline job.
+      - name: Trivy — IaC misconfiguration scan (SARIF, devops only)
+        if: always() && inputs.profile == 'devops'
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: config
+          scan-ref: .
+          format: sarif
+          output: trivy-results.sarif
+          exit-code: "0"
+          skip-dirs: ".git,node_modules"
+
+      # ── Upload SARIF to GitHub Security tab ───────────────────────────────
+      # Uploads trivy-results.sarif to the repository's code scanning alerts.
+      # if: always() is critical here: it ensures the upload runs whether the
+      # scan step above succeeded, failed, or was skipped (e.g. because a
+      # previous job failure put the runner into a failed state). Without
+      # if: always() the Security tab would go stale whenever a pipeline fails.
+      # category distinguishes devops IaC findings from dependency findings in
+      # the Security tab so the two alert types appear in separate views.
+      - name: Upload SARIF to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-${{ inputs.profile }}
+
+      # ── Detect Dockerfiles ─────────────────────────────────────────────────
+      # Checks for any Dockerfile (including named variants like Dockerfile.prod,
+      # Dockerfile.dev) across ALL profiles — any repo may ship a container.
+      # Also extracts every unique base image from FROM instructions so the
+      # image CVE scan step below can pull and inspect them without re-parsing.
+      # Skips scratch (no OS layer to scan) and build-stage aliases (AS builder).
+      # The has_dockerfile and base_images outputs gate the three scan steps
+      # that follow so they are a complete no-op for repos without containers.
+      - name: Detect Dockerfiles and extract base images
+        if: always()
+        id: detect-dockerfile
+        run: |
+          DOCKERFILES=$(find . -name "Dockerfile*" \
+            -not -path "./.git/*" \
+            -not -path "./node_modules/*" \
+            -not -path "./dist/*" \
+            -not -path "./build/*" || true)
+
+          if [[ -z "$DOCKERFILES" ]]; then
+            echo "has_dockerfile=false" >> "$GITHUB_OUTPUT"
+            echo "No Dockerfiles found — all Dockerfile scan steps will be skipped"
+            exit 0
+          fi
+
+          echo "has_dockerfile=true" >> "$GITHUB_OUTPUT"
+          echo "Dockerfiles found:"
+          echo "$DOCKERFILES"
+
+          # Collect every unique non-scratch, non-alias base image across all
+          # Dockerfiles. Multi-stage builds have multiple FROM lines; we skip
+          # lines with AS <name> because those are intermediate build stages, not
+          # the runtime base. The final non-alias FROM is the image that ends up
+          # in production and is the most important one to scan.
+          BASE_IMAGES=$(echo "$DOCKERFILES" | while IFS= read -r df; do
+            grep -iE "^FROM" "$df" \
+              | grep -iv " AS " \
+              | awk '{print $2}'
+          done | grep -iv "scratch" | sort -u)
+
+          if [[ -z "$BASE_IMAGES" ]]; then
+            echo "base_images=" >> "$GITHUB_OUTPUT"
+          else
+            echo "Unique base images to scan:"
+            echo "$BASE_IMAGES"
+            # Write as newline-delimited multiline output
+            {
+              echo "base_images<<EOF"
+              echo "$BASE_IMAGES"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── Dockerfile misconfiguration and secret scan (SARIF) ────────────────
+      # Scans every Dockerfile instruction for misconfigurations and hardcoded
+      # secrets. Catches:
+      #   • running as root (no USER instruction)
+      #   • FROM using :latest or a digest-less mutable tag
+      #   • ADD from a remote URL instead of COPY
+      #   • secrets/tokens hardcoded in ENV, ARG, or LABEL
+      #   • unnecessary EXPOSE of privileged ports
+      #   • missing HEALTHCHECK
+      # scan-type: config reads Dockerfile instructions statically without
+      # pulling any image — fast and network-free.
+      # scanners: misconfig,secret covers both categories in one pass.
+      # exit-code 0 — this scan feeds the Security tab only; the pipeline
+      # gate is the base image CVE step below.
+      - name: Trivy — Dockerfile misconfiguration and secret scan (SARIF)
+        if: always() && steps.detect-dockerfile.outputs.has_dockerfile == 'true'
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: config
+          scan-ref: .
+          scanners: misconfig,secret
+          format: sarif
+          output: trivy-dockerfile-misconfig.sarif
+          exit-code: "0"
+          skip-dirs: ".git,node_modules,dist,build,.next,.nuxt,.terraform"
+
+      - name: Upload Dockerfile misconfiguration SARIF to GitHub Security tab
+        if: always() && steps.detect-dockerfile.outputs.has_dockerfile == 'true'
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-dockerfile-misconfig.sarif
+          category: trivy-dockerfile-misconfig
+
+      # ── Base image CVE scan — pipeline gate + Security tab ─────────────────
+      # This step is the centralised replacement for the per-profile base image
+      # checks. It runs for ALL profiles so a Java repo with a Dockerfile gets
+      # the same CVE gate as a DevOps repo.
+      #
+      # For every unique base image found in Step "Detect":
+      #   1. Pulls the image and scans its OS package layer (apt/apk/rpm) and
+      #      any language packages installed into it (pip, npm, gem, etc.).
+      #   2. Prints a table report to the log — exits non-zero on CRITICAL/HIGH
+      #      so the pipeline fails if the base image has known CVEs.
+      #   3. Also writes a SARIF file per image into sarif-images/ for the
+      #      Security tab upload that follows.
+      #
+      # Why both table and SARIF in the same step:
+      #   • table + exit-code 1 → blocks the merge (hard gate)
+      #   • sarif + exit-code 0 → persistent Security tab alert history
+      #   Running trivy image twice per image (once per format) is acceptable
+      #   because the second run hits the local image cache pulled by the first.
+      #
+      # Graceful fallback: if base_images output is empty (all FROMs were
+      # scratch or intermediate aliases) the loop body never executes and the
+      # step exits 0 cleanly.
+      - name: Trivy — base image CVE scan (pipeline gate + SARIF)
+        if: always() && steps.detect-dockerfile.outputs.has_dockerfile == 'true'
+        run: |
+          BASE_IMAGES="${{ steps.detect-dockerfile.outputs.base_images }}"
+
+          if [[ -z "$BASE_IMAGES" ]]; then
+            echo "No scannable base images found (all were scratch or build aliases)"
+            exit 0
+          fi
+
+          mkdir -p sarif-images
+          PIPELINE_FAILED=0
+
+          while IFS= read -r IMAGE; do
+            [[ -z "$IMAGE" ]] && continue
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "Scanning base image: $IMAGE"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+            # ── Pipeline gate: table report, fails on CRITICAL/HIGH ──────────
+            trivy image \
+              --exit-code 1 \
+              --severity CRITICAL,HIGH \
+              --vuln-type os,library \
+              --scanners vuln \
+              --no-progress \
+              --format table \
+              "$IMAGE" || PIPELINE_FAILED=1
+
+            # ── Security tab: SARIF report, always exit 0 ────────────────────
+            # Second scan hits the locally cached image pulled above — no extra
+            # network download. Severity intentionally wider (adds MEDIUM) so
+            # the Security tab shows a fuller picture than the blocking gate.
+            SAFE_NAME=$(echo "$IMAGE" | tr '/:.@' '----')
+            trivy image \
+              --exit-code 0 \
+              --severity CRITICAL,HIGH,MEDIUM \
+              --vuln-type os,library \
+              --scanners vuln \
+              --no-progress \
+              --format sarif \
+              --output "sarif-images/trivy-image-${SAFE_NAME}.sarif" \
+              "$IMAGE" || true
+
+          done <<< "$BASE_IMAGES"
+
+          exit $PIPELINE_FAILED
+
+      # Upload all per-image SARIF files at once — upload-sarif accepts a
+      # directory path and ingests every .sarif file found inside it.
+      # All findings appear under the trivy-image-cve category in the Security
+      # tab, grouped separately from Dockerfile misconfig and dependency alerts.
+      - name: Upload base image CVE SARIF to GitHub Security tab
+        if: always() && steps.detect-dockerfile.outputs.has_dockerfile == 'true'
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: sarif-images/
+          category: trivy-image-cve
