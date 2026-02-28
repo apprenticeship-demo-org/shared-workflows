@@ -10,3 +10,20 @@ on:
         required: false
         type: string
         default: "summary"
+jobs:
+  copilot-review:
+    name: AI Code Review
+    runs-on: ubuntu-latest
+    steps:
+      - name: AI review coming soon
+        run: |
+          echo "::notice title=AI Review::🤖 AI-powered code review is coming soon! Stay tuned."
+          echo ""
+          echo "  ┌─────────────────────────────────────────────────┐"
+          echo "  │  🤖  AI Code Review — Coming Soon               │"
+          echo "  │                                                 │"
+          echo "  │  Automated PR reviews powered by GitHub         │"
+          echo "  │  Copilot will appear here in a future update.   │"
+          echo "  │                                                 │"
+          echo "  │  Review level requested: ${{ inputs.review-level }}"
+          echo "  └─────────────────────────────────────────────────┘"
