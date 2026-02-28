@@ -35,6 +35,7 @@
 18. [Secrets reference](#18-secrets-reference)
 19. [Repository access control setup](#19-repository-access-control-setup)
 20. [Contributing](#20-contributing)
+21. [Lab repository templates](#21-lab-repository-templates)
 
 ---
 
@@ -809,3 +810,109 @@ act push -W .github/workflows/pipeline.yml \
   --secret-file .env.secrets \
   --input profile=java
 ```
+
+---
+
+## 21. Lab repository templates
+
+The `templates/` directory contains ready-to-use starter files for each profile. Copy the contents of the relevant profile folder into a new lab repository to get a working CI pipeline with zero configuration.
+
+### Template layout
+
+```
+templates/
+├── java/
+│   ├── ci-profile.yml                          ← tells pipeline.yml to use the java profile
+│   ├── .github/workflows/ci.yml                ← calls pipeline.yml on push / pull_request
+│   ├── pom.xml                                 ← Maven project with JaCoCo + Checkstyle pre-configured
+│   └── src/
+│       ├── main/java/com/example/App.java       ← starter application class
+│       └── test/java/com/example/AppTest.java   ← starter JUnit 5 tests
+├── python/
+│   ├── ci-profile.yml
+│   ├── .github/workflows/ci.yml
+│   ├── requirements.txt                         ← empty starter; add project deps here
+│   ├── main.py                                  ← starter module
+│   └── test_main.py                             ← starter pytest tests
+├── javascript/
+│   ├── ci-profile.yml
+│   ├── .github/workflows/ci.yml
+│   ├── package.json                             ← Jest + ESLint configured
+│   ├── .eslintrc.json                           ← ESLint config (eslint:recommended)
+│   └── src/
+│       ├── index.js                             ← starter module
+│       └── index.test.js                        ← starter Jest tests
+└── devops/
+    ├── ci-profile.yml
+    ├── .github/workflows/ci.yml
+    ├── .yamllint.yml                            ← yamllint config (120-char lines, strict truthy)
+    └── Dockerfile                               ← commented best-practice Dockerfile starter
+```
+
+### How to use a template
+
+1. Create a new repository on GitHub (empty).
+2. Copy the contents of the matching `templates/<profile>/` folder into the new repository root:
+
+   ```bash
+   # Example for a Java lab
+   cp -r templates/java/. /path/to/new-lab-repo/
+   ```
+
+3. Open `.github/workflows/ci.yml` and replace `<YOUR-ORG>` with the GitHub organisation name:
+
+   ```yaml
+   uses: my-org/shared-workflows/.github/workflows/pipeline.yml@main
+   ```
+
+4. Push to `main`. The pipeline runs automatically.
+
+### What each template provides
+
+#### Java template
+
+| File | Purpose |
+|------|---------|
+| `ci-profile.yml` | Sets `profile: java` so `pipeline.yml` routes to `profiles/java.yml` |
+| `.github/workflows/ci.yml` | Triggers on push/PR; passes `secrets: inherit` |
+| `pom.xml` | Maven project set to Java 21; includes **JaCoCo** (coverage for SonarQube) and **Checkstyle** (Google Java Style, required by the lint step) and **Surefire** (JUnit 5 runner) |
+| `src/main/java/com/example/App.java` | Minimal `greet()` implementation to verify the build works end-to-end |
+| `src/test/java/com/example/AppTest.java` | Three JUnit 5 tests covering `greet()`; enough to produce a non-zero JaCoCo report |
+
+> **Customise:** Change `groupId`, `artifactId`, and `version` in `pom.xml`. Replace `App.java` and `AppTest.java` with your implementation.
+
+#### Python template
+
+| File | Purpose |
+|------|---------|
+| `ci-profile.yml` | Sets `profile: python` |
+| `.github/workflows/ci.yml` | Triggers on push/PR |
+| `requirements.txt` | Empty starter with comments explaining what to add (pytest/flake8 are pre-installed by CI and should NOT be listed here) |
+| `main.py` | Minimal `greet()` function with type hints and docstring (satisfies flake8 out of the box) |
+| `test_main.py` | Three pytest tests; generates `coverage.xml` for SonarQube |
+
+> **Note:** The CI pipeline pre-installs `pytest`, `pytest-cov`, `flake8`, and `requests`. Do not add these to `requirements.txt` — they will already be available in the CI environment.
+
+#### JavaScript template
+
+| File | Purpose |
+|------|---------|
+| `ci-profile.yml` | Sets `profile: javascript` |
+| `.github/workflows/ci.yml` | Triggers on push/PR; includes commented `with:` block for `package_manager` and `framework` overrides |
+| `package.json` | npm project with **Jest** (test runner, auto-detected by the pipeline) and **ESLint** (auto-detected via `.eslintrc.json`) |
+| `.eslintrc.json` | `eslint:recommended` ruleset with `node` + `jest` environments enabled |
+| `src/index.js` | Minimal `greet()` function |
+| `src/index.test.js` | Three Jest tests with coverage; uses `--coverage` flag wired in `package.json` |
+
+> **Framework upgrade:** To use React, Next.js, Vue, etc., install the framework package and add its dependencies to `package.json`. The pipeline's detection step will automatically pick up the framework from `package.json` dependencies.
+
+#### DevOps template
+
+| File | Purpose |
+|------|---------|
+| `ci-profile.yml` | Sets `profile: devops` |
+| `.github/workflows/ci.yml` | Triggers on push/PR; includes commented `terraform-version` and `dockerfile-path` overrides |
+| `.yamllint.yml` | yamllint config: 120-char line limit (warning only), strict `truthy` values, 2-space indentation |
+| `Dockerfile` | Heavily commented best-practice Dockerfile: pinned base image, single-layer `RUN`, non-root `USER`, `COPY --chown`, exec-form `CMD` — designed to pass hadolint without warnings |
+
+> **Terraform / Helm:** The devops pipeline automatically detects `*.tf` files and `Chart.yaml`. Add them to the repository root and the pipeline will run `terraform validate`, `tflint`, and `helm lint` automatically — no workflow changes needed.

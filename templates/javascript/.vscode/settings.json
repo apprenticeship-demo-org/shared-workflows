@@ -1,0 +1,50 @@
+{
+  // ---------- Editor --------------------------------------------------------
+  "editor.formatOnSave": true,
+  "editor.rulers": [100],
+  "editor.tabSize": 2,
+  "editor.insertSpaces": true,
+  "files.trimTrailingWhitespace": true,
+  "files.insertFinalNewline": true,
+  "files.eol": "\n",
+
+  // ---------- JavaScript / TypeScript ---------------------------------------
+  "[javascript]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode"
+  },
+  "[javascriptreact]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode"
+  },
+  "[typescript]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode"
+  },
+  "[typescriptreact]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode"
+  },
+  "[json]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode"
+  },
+  "editor.codeActionsOnSave": {
+    "source.fixAll.eslint": "explicit"
+  },
+  "eslint.validate": [
+    "javascript",
+    "javascriptreact",
+    "typescript",
+    "typescriptreact"
+  ],
+
+  // ---------- SonarLint -----------------------------------------------------
+  // Connected mode: replace with your actual SonarQube / SonarCloud connection
+  // "sonarlint.connectedMode.connections.sonarqube": [
+  //   { "serverUrl": "https://sonarqube.your-org.com", "connectionId": "my-sonar" }
+  // ],
+
+  // ---------- Files to hide from explorer -----------------------------------
+  "files.exclude": {
+    "node_modules/": true,
+    "coverage/": false,
+    "dist/": false,
+    "build/": false
+  }
+}

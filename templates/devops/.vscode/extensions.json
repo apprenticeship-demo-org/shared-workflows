@@ -1,0 +1,20 @@
+{
+  "recommendations": [
+    // YAML: schema validation, IntelliSense for k8s/GitHub Actions/etc.
+    "redhat.vscode-yaml",
+    // Terraform: syntax, validation, formatting
+    "HashiCorp.terraform",
+    // Docker: Dockerfile syntax + compose support
+    "ms-azuretools.vscode-docker",
+    // SonarLint: real-time code quality analysis matching SonarQube server rules
+    "SonarSource.sonarlint-vscode",
+    // GitLens: rich Git history / blame annotations
+    "eamodio.gitlens",
+    // Hadolint: Dockerfile linting inline
+    "exiasr.hadolint",
+    // Helm: chart syntax support
+    "Tim-Koehler.helm-intellisense",
+    // Markdown linting for docs
+    "DavidAnson.vscode-markdownlint"
+  ]
+}

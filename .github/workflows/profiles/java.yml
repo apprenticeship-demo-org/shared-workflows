@@ -92,7 +92,11 @@ jobs:
       # intentionally placed here so a style failure stops the pipeline before
       # any compute-intensive work (compilation, test execution) starts.
       - name: Lint — Checkstyle
-        run: ./mvnw --batch-mode --no-transfer-progress checkstyle:check
+        run: |
+          # Ensure the wrapper script is executable regardless of how the repo
+          # was checked out (Windows git, zip download, etc.).
+          chmod +x mvnw 2>/dev/null || true
+          ./mvnw --batch-mode --no-transfer-progress checkstyle:check
 
       # ── 6. Build and test (mvn verify) ─────────────────────────────────────
       # mvn verify runs the full lifecycle: compile → test → package → verify.
@@ -102,7 +106,44 @@ jobs:
       - name: Build and test
         run: ./mvnw --batch-mode --no-transfer-progress verify
 
-      # ── 7. Prune SNAPSHOT dependencies from cache ──────────────────────────
+      # ── 6b. Post JaCoCo coverage summary ────────────────────────────────────
+      # Parses target/site/jacoco/jacoco.xml — produced by `mvn verify` when
+      # the JaCoCo plugin is in pom.xml. Writes a coverage table to the Actions
+      # job summary so the result is visible on the run overview page without
+      # opening SonarQube. A ::warning annotation flags low coverage, but the
+      # pipeline is NOT failed here — SonarQube is the quality gate for coverage.
+      - name: Post coverage summary
+        if: always()
+        run: |
+          XML=target/site/jacoco/jacoco.xml
+          if [[ ! -f "$XML" ]]; then
+            echo "## ⚪ Java Test Coverage: N/A" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "_JaCoCo report not found — either no tests ran or the jacoco-maven-plugin is not configured in pom.xml._" >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning title=No Coverage Report::JaCoCo XML not found. Ensure jacoco-maven-plugin is in pom.xml and at least one test class exists."
+            exit 0
+          fi
+          python3 - <<'PYEOF'
+          import xml.etree.ElementTree as ET, os
+          root = ET.parse("target/site/jacoco/jacoco.xml").getroot()
+          counters = {c.attrib["type"]: c.attrib for c in root.findall("counter")}
+          def pct(c):
+              covered = int(c.get("covered", 0))
+              total   = covered + int(c.get("missed", 0))
+              return (covered / total * 100) if total else 0.0
+          line_pct   = pct(counters.get("LINE",   {}))
+          branch_pct = pct(counters.get("BRANCH", {}))
+          icon = "🟢" if line_pct >= 80 else "🟡"
+          flag = "✅ Pass" if line_pct >= 80 else "⚠️ Below threshold — SonarQube quality gate may fail"
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(f"## {icon} Java Test Coverage: {line_pct:.1f}%\n\n")
+              f.write("| Metric | Coverage | Threshold | Status |\n")
+              f.write("|--------|----------|-----------|--------|\n")
+              f.write(f"| Line coverage   | {line_pct:.1f}%   | 80% | {flag} |\n")
+              f.write(f"| Branch coverage | {branch_pct:.1f}% | —   | —      |\n")
+          if line_pct < 80:
+              print(f"::warning title=Low Coverage::Java line coverage is {line_pct:.1f}%. Aim for ≥ 80% — SonarQube quality gate will fail below threshold.")
+          PYEOF ──────────────────────────
       # SNAPSHOT artifacts are re-published frequently; caching them causes
       # stale hit rates and hidden build failures. Deleting them before the
       # post-job cache-save step ensures only stable release JARs are stored,

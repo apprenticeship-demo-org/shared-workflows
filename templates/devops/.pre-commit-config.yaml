@@ -1,0 +1,75 @@
+# Pre-commit hooks for DevOps / infrastructure projects
+# Install: pip install pre-commit  →  pre-commit install
+# Run manually: pre-commit run --all-files
+# Docs: https://pre-commit.com
+
+repos:
+
+  # ---------------------------------------------------------------------------
+  # General hygiene
+  # ---------------------------------------------------------------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: check-yaml
+        args: [--unsafe]
+        exclude: ^(templates/|charts/)   # Helm templates use {{ }} syntax
+      - id: check-json
+      - id: check-added-large-files
+        args: [--maxkb=2048]
+      - id: detect-private-key
+      - id: check-merge-conflict
+      - id: no-commit-to-branch
+        args: [--branch=main, --branch=master]
+
+  # ---------------------------------------------------------------------------
+  # YAML linting (mirrors CI yamllint step)
+  # ---------------------------------------------------------------------------
+  - repo: https://github.com/adrienverge/yamllint
+    rev: v1.35.1
+    hooks:
+      - id: yamllint
+        args: [--config-file=.yamllint.yml]
+        exclude: ^(\.github/|charts/templates/)
+
+  # ---------------------------------------------------------------------------
+  # Dockerfile linting
+  # ---------------------------------------------------------------------------
+  - repo: https://github.com/hadolint/hadolint
+    rev: v2.13.0-beta
+    hooks:
+      - id: hadolint-docker
+        args: [--failure-threshold=warning]
+
+  # ---------------------------------------------------------------------------
+  # Terraform formatting + validation (mirrors CI terraform fmt step)
+  # Requires: terraform binary installed locally
+  # ---------------------------------------------------------------------------
+  - repo: local
+    hooks:
+      - id: terraform-fmt
+        name: Terraform fmt
+        language: system
+        entry: terraform fmt -recursive
+        pass_filenames: false
+        files: \.tf$
+      - id: terraform-validate
+        name: Terraform validate
+        language: system
+        entry: bash -c 'terraform init -backend=false -input=false -no-color 2>/dev/null && terraform validate -no-color'
+        pass_filenames: false
+        files: \.tf$
+
+  # ---------------------------------------------------------------------------
+  # Secret detection
+  # ---------------------------------------------------------------------------
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+        args: [--baseline, .secrets.baseline]

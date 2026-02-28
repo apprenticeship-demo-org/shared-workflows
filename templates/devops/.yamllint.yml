@@ -1,0 +1,36 @@
+# yamllint configuration for DevOps labs.
+#
+# The CI pipeline searches for this file at the repo root.
+# If it is absent, yamllint runs with its built-in defaults.
+# Adjust the rules below to match your team's conventions.
+
+extends: default
+
+# Ignore GitHub Actions workflow files — their use of `on:` as a mapping key
+# (which is a YAML truthy value) is intentional and cannot be changed.
+ignore: |
+  .github/
+  .git/
+
+rules:
+  line-length:
+    max: 120
+    level: warning        # warn but do not fail the pipeline
+
+  truthy:
+    # Require explicit true/false instead of yes/no/on/off
+    allowed-values: ["true", "false"]
+    check-keys: true
+
+  indentation:
+    spaces: 2
+    indent-sequences: true
+    check-multi-line-strings: false
+
+  comments:
+    min-spaces-from-content: 1
+
+  # Allow empty values in YAML mappings (common in Kubernetes manifests)
+  empty-values:
+    forbid-in-block-mappings: false
+    forbid-in-flow-mappings: true

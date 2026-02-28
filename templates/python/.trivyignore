@@ -1,0 +1,20 @@
+# Trivy vulnerability ignore file
+# Syntax: <CVE-ID> [expiry]  [optional comment after a space]
+#
+# Examples:
+#   CVE-2021-44228                  # ignore forever
+#   CVE-2022-22965 2025-12-31       # ignore until end of 2025
+#
+# Only suppress a CVE when:
+#   1. You have assessed the vulnerability and confirmed it does not apply to
+#      your use case (e.g. the vulnerable code path is never executed), OR
+#   2. There is no fix available yet and you have a documented risk-acceptance.
+#
+# Never suppress a CRITICAL or HIGH CVE without a written justification.
+#
+# Keep this file sorted and add a comment with the reason for each entry.
+
+# ---------------------------------------------------------------------------
+# Example suppression — REMOVE THIS and add real entries as needed
+# ---------------------------------------------------------------------------
+# CVE-2023-XXXXX 2025-12-31  # False positive: only affects Python 2 code paths

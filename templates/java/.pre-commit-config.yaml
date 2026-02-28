@@ -1,0 +1,52 @@
+# Pre-commit hooks for Java projects
+# Install: pip install pre-commit  →  pre-commit install
+# Run manually: pre-commit run --all-files
+# Docs: https://pre-commit.com
+
+repos:
+
+  # ---------------------------------------------------------------------------
+  # General hygiene
+  # ---------------------------------------------------------------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: check-xml                   # validates pom.xml, checkstyle files
+      - id: check-yaml
+        args: [--unsafe]                # allow custom YAML tags
+      - id: check-json
+      - id: check-added-large-files
+        args: [--maxkb=1024]
+      - id: detect-private-key
+      - id: check-merge-conflict
+      - id: no-commit-to-branch
+        args: [--branch=main, --branch=master]
+
+  # ---------------------------------------------------------------------------
+  # Secret detection
+  # ---------------------------------------------------------------------------
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+        args: [--baseline, .secrets.baseline]
+        exclude: package-lock\.json
+
+  # ---------------------------------------------------------------------------
+  # Maven Checkstyle (mirrors the CI step)
+  # Requires: Java + Maven on the local machine
+  # ---------------------------------------------------------------------------
+  - repo: local
+    hooks:
+      - id: maven-checkstyle
+        name: Maven Checkstyle
+        language: system
+        entry: bash -c 'chmod +x mvnw 2>/dev/null || true && ./mvnw checkstyle:check -q --no-transfer-progress'
+        pass_filenames: false
+        files: \.java$
+        stages: [pre-commit]

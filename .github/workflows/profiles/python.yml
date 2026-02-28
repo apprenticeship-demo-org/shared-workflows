@@ -158,7 +158,54 @@ jobs:
       # Tests run after the Trivy scan so vulnerable dependencies are caught
       # before any test-suite compute is spent on them.
       - name: Test — pytest with coverage
-        run: pytest --cov=. --cov-report=xml
+        run: |
+          # pytest exit codes:
+          #   0 — all tests passed
+          #   1 — some tests failed  (hard failure — keep this)
+          #   5 — no tests collected (soft warning — early-stage repos may have
+          #       no test files yet; let SonarQube flag the 0 % coverage)
+          set +e
+          pytest --cov=. --cov-report=xml --cov-report=term-missing
+          EXIT_CODE=$?
+          set -e
+
+          if [[ "$EXIT_CODE" == "5" ]]; then
+            echo "::warning title=No Tests Found::No test files were collected. Add tests and aim for ≥ 80% coverage — SonarQube will flag low coverage."
+            # Write a minimal coverage.xml so the SonarQube workflow can still
+            # run and report 0 % rather than erroring on a missing file.
+            echo '<?xml version="1.0" ?><coverage version="7.4.0" timestamp="0" lines-valid="0" lines-covered="0" line-rate="0" branches-covered="0" branches-valid="0" branch-rate="0" complexity="0"><packages/></coverage>' > coverage.xml
+          elif [[ "$EXIT_CODE" != "0" ]]; then
+            exit "$EXIT_CODE"
+          fi
+
+          # ── Post coverage to the Actions job summary ───────────────────────
+          # Visible on the workflow run overview without opening SonarQube.
+          # A ::warning annotation flags coverage below 80 % but does NOT fail
+          # the pipeline — SonarQube is the quality gate for coverage.
+          if [[ -f coverage.xml ]]; then
+            COVERAGE=$(python3 -c "
+import xml.etree.ElementTree as ET
+try:
+    rate = float(ET.parse('coverage.xml').getroot().attrib.get('line-rate', 0)) * 100
+    print(f'{rate:.1f}')
+except Exception:
+    print('unknown')
+" 2>/dev/null || echo unknown)
+            if [[ "$COVERAGE" != "unknown" ]]; then
+              PCT=${COVERAGE%.*}
+              if (( PCT >= 80 )); then ICON="🟢"; FLAG="✅ Pass"; else ICON="🟡"; FLAG="⚠️ Below threshold — SonarQube quality gate may fail"; fi
+              echo "## ${ICON} Python Test Coverage: ${COVERAGE}%" >> "$GITHUB_STEP_SUMMARY"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+              echo "| Metric | Value |" >> "$GITHUB_STEP_SUMMARY"
+              echo "|--------|-------|" >> "$GITHUB_STEP_SUMMARY"
+              echo "| Line coverage | ${COVERAGE}% |" >> "$GITHUB_STEP_SUMMARY"
+              echo "| Threshold     | 80%           |" >> "$GITHUB_STEP_SUMMARY"
+              echo "| SonarQube gate | ${FLAG}       |" >> "$GITHUB_STEP_SUMMARY"
+              if (( PCT < 80 )); then
+                echo "::warning title=Low Coverage::Python line coverage is ${COVERAGE}%. Aim for ≥ 80% — SonarQube quality gate will fail below threshold."
+              fi
+            fi
+          fi
 
       # ── 10. Upload build artifacts ─────────────────────────────────────────
       # Persist the JaCoCo-equivalent coverage.xml so the downstream SonarQube

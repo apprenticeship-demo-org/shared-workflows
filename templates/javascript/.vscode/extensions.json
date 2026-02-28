@@ -1,0 +1,18 @@
+{
+  "recommendations": [
+    // ESLint: highlights lint errors inline as you type
+    "dbaeumer.vscode-eslint",
+    // Prettier: auto-formats on save
+    "esbenp.prettier-vscode",
+    // SonarLint: real-time code quality analysis matching SonarQube server rules
+    "SonarSource.sonarlint-vscode",
+    // GitLens: rich Git history / blame annotations
+    "eamodio.gitlens",
+    // npm intellisense for package.json imports
+    "christian-kohler.npm-intellisense",
+    // Jest test runner integration
+    "Orta.vscode-jest",
+    // Markdown linting for docs
+    "DavidAnson.vscode-markdownlint"
+  ]
+}

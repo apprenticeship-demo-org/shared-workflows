@@ -1,0 +1,16 @@
+{
+  "recommendations": [
+    // Java language support (includes IntelliSense, debugger, test runner, Maven)
+    "vscjava.vscode-java-pack",
+    // SonarLint: real-time code quality analysis matching SonarQube server rules
+    "SonarSource.sonarlint-vscode",
+    // Checkstyle: highlights violations inline as you type
+    "shengchen.vscode-checkstyle",
+    // GitLens: rich Git history / blame annotations
+    "eamodio.gitlens",
+    // XML editor for pom.xml
+    "redhat.vscode-xml",
+    // Markdown linting for docs
+    "DavidAnson.vscode-markdownlint"
+  ]
+}

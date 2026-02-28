@@ -1,0 +1,54 @@
+{
+  // ---------- Editor --------------------------------------------------------
+  "editor.formatOnSave": true,
+  "editor.rulers": [120],
+  "editor.tabSize": 2,
+  "editor.insertSpaces": true,
+  "files.trimTrailingWhitespace": true,
+  "files.insertFinalNewline": true,
+  "files.eol": "\n",
+
+  // ---------- YAML ----------------------------------------------------------
+  "[yaml]": {
+    "editor.defaultFormatter": "redhat.vscode-yaml"
+  },
+  "yaml.schemas": {
+    // GitHub Actions schema for workflow files
+    "https://json.schemastore.org/github-workflow.json": ".github/workflows/*.yml",
+    // Docker Compose schema
+    "https://raw.githubusercontent.com/compose-spec/compose-spec/master/schema/compose-spec.json": [
+      "docker-compose*.yml",
+      "compose*.yml"
+    ]
+  },
+  "yaml.validate": true,
+  "yaml.format.enable": true,
+
+  // ---------- Terraform -----------------------------------------------------
+  "[terraform]": {
+    "editor.defaultFormatter": "HashiCorp.terraform",
+    "editor.formatOnSave": true
+  },
+  "[terraform-vars]": {
+    "editor.defaultFormatter": "HashiCorp.terraform",
+    "editor.formatOnSave": true
+  },
+  "terraform.languageServer.enable": true,
+
+  // ---------- Docker --------------------------------------------------------
+  "hadolint.hadolintPath": "hadolint",
+
+  // ---------- SonarLint -----------------------------------------------------
+  // Connected mode: replace with your actual SonarQube / SonarCloud connection
+  // "sonarlint.connectedMode.connections.sonarqube": [
+  //   { "serverUrl": "https://sonarqube.your-org.com", "connectionId": "my-sonar" }
+  // ],
+
+  // ---------- Files to hide from explorer -----------------------------------
+  "files.exclude": {
+    "**/.terraform": true,
+    "**/.terraform.lock.hcl": false,
+    "**/*.tfstate": true,
+    "**/*.tfstate.backup": true
+  }
+}

@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.vscode/**'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE.md'
+      - '.trivyignore'
+      - '.gitignore'
+  pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.vscode/**'
+      - '.github/ISSUE_TEMPLATE/**'
+      - '.github/PULL_REQUEST_TEMPLATE.md'
+      - '.trivyignore'
+      - '.gitignore'
+
+jobs:
+  pipeline:
+    # ── Replace <YOUR-ORG> with your GitHub organisation name ──────────────
+    uses: <YOUR-ORG>/shared-workflows/.github/workflows/pipeline.yml@main
+    secrets: inherit
+    # Optional overrides — uncomment and edit only the lines you need:
+    # with:
+    #   python-version: "3.12"     # default: 3.12
+    #   sonar-project-key: ""      # default: auto-derived as {org}_{repo}

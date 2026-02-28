@@ -306,19 +306,24 @@ jobs:
             ${{ runner.os }}-cypress-
 
       # ── 7. Install dependencies ────────────────────────────────────────────
-      # All four commands use frozen/ci mode which installs exactly what is in
-      # the lock file and fails if the lock file is out of sync with package.json.
-      # This catches apprentices who edited package.json without running install.
-      # This step installs everything declared in package.json including Playwright
-      # and Cypress if they are listed — no additional install commands are needed
-      # for E2E tools at this point.
+      # Frozen/ci mode is preferred: it validates that the lock file is in sync
+      # with package.json. For npm, if no package-lock.json exists (e.g. a brand
+      # new repo that has not yet committed its lock file) we fall back to
+      # npm install and emit a warning so the apprentice knows to commit it.
       - name: Install dependencies
         run: |
           case "${{ steps.detect.outputs.pm }}" in
-            npm)  npm ci ;;
+            npm)
+              if [[ -f package-lock.json ]]; then
+                npm ci
+              else
+                echo "::warning title=No Lock File::package-lock.json not found — running npm install. Commit the generated lock file for reproducible builds."
+                npm install
+              fi
+              ;;
             yarn) yarn install --frozen-lockfile ;;
             pnpm) pnpm install --frozen-lockfile ;;
-            bun)  bun install --frozen-lockfile ;;
+            bun)  bun install --frozen-lockfile  ;;
           esac
 
       # ── 8. Install E2E browser binaries (cache miss only) ─────────────────
@@ -495,6 +500,50 @@ jobs:
               ;;
           esac
         continue-on-error: ${{ steps.detect.outputs.test_runner == 'none' }}
+
+      # ── 12b. Post coverage summary ─────────────────────────────────────────
+      # Reads Jest/Vitest coverage-summary.json when present and posts a
+      # coverage table to the Actions job summary. A ::warning annotation flags
+      # coverage below 80 % but does NOT fail the pipeline — SonarQube is the
+      # quality gate. If no coverage file is found the step is a no-op.
+      - name: Post coverage summary
+        if: always()
+        run: |
+          SUMMARY=""
+          # Jest writes coverage/coverage-summary.json; Vitest writes the same
+          # path when --coverage is passed. Fall back to coverage-report/ for
+          # older Jest configurations.
+          for f in coverage/coverage-summary.json coverage-report/coverage-summary.json; do
+            if [[ -f "$f" ]]; then SUMMARY="$f"; break; fi
+          done
+
+          if [[ -z "$SUMMARY" ]]; then
+            exit 0  # No coverage report — test runner may not support it
+          fi
+
+          export COVERAGE_SUMMARY="$SUMMARY"
+          python3 - <<'PYEOF'
+          import json, os
+          with open(os.environ["COVERAGE_SUMMARY"]) as f:
+              data = json.load(f)
+          totals = data.get("total", {})
+          lines  = totals.get("lines",      {}).get("pct", 0)
+          stmts  = totals.get("statements", {}).get("pct", 0)
+          funcs  = totals.get("functions",  {}).get("pct", 0)
+          branch = totals.get("branches",   {}).get("pct", 0)
+          icon = "🟢" if lines >= 80 else "🟡"
+          flag = "✅ Pass" if lines >= 80 else "⚠️ Below threshold — SonarQube quality gate may fail"
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(f"## {icon} JavaScript Test Coverage: {lines:.1f}%\n\n")
+              f.write("| Metric | Coverage | Threshold | Status |\n")
+              f.write("|--------|----------|-----------|--------|\n")
+              f.write(f"| Lines      | {lines:.1f}%  | 80% | {flag} |\n")
+              f.write(f"| Statements | {stmts:.1f}%  | —   | —      |\n")
+              f.write(f"| Functions  | {funcs:.1f}%  | —   | —      |\n")
+              f.write(f"| Branches   | {branch:.1f}% | —   | —      |\n")
+          if lines < 80:
+              print(f"::warning title=Low Coverage::JavaScript line coverage is {lines:.1f}%. Aim for ≥ 80% — SonarQube quality gate will fail below threshold.")
+          PYEOF
 
       # ── 13. Trivy dependency CVE scan ─────────────────────────────────────
       # - Trivy scans the lock file (package-lock.json, yarn.lock, or

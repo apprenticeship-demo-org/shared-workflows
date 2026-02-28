@@ -1,0 +1,3 @@
+# ci-profile.yml — place this file at the ROOT of your lab repository (not inside .github/).
+# The CI pipeline reads this file to decide which profile workflow to run.
+profile: javascript

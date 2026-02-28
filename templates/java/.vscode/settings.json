@@ -1,0 +1,44 @@
+{
+  // ---------- Editor --------------------------------------------------------
+  "editor.formatOnSave": true,
+  "editor.rulers": [120],
+  "editor.tabSize": 2,
+  "editor.insertSpaces": true,
+  "files.trimTrailingWhitespace": true,
+  "files.insertFinalNewline": true,
+  "files.eol": "\n",
+
+  // ---------- Java ----------------------------------------------------------
+  "java.format.settings.url": "https://raw.githubusercontent.com/google/styleguide/gh-pages/eclipse-java-google-style.xml",
+  "java.format.settings.profile": "GoogleStyle",
+  "[java]": {
+    "editor.defaultFormatter": "redhat.java",
+    "editor.tabSize": 2
+  },
+
+  // ---------- Checkstyle ----------------------------------------------------
+  "java.checkstyle.configuration": "${workspaceFolder}/.mvn/checkstyle.xml",
+  "java.checkstyle.version": "10.17.0",
+  "java.checkstyle.modules": ["com.puppycrawl.tools.checkstyle.checks.naming.*"],
+
+  // ---------- XML (pom.xml) -------------------------------------------------
+  "[xml]": {
+    "editor.defaultFormatter": "redhat.vscode-xml"
+  },
+
+  // ---------- SonarLint -----------------------------------------------------
+  // Connected mode: replace with your actual SonarQube / SonarCloud connection
+  // "sonarlint.connectedMode.connections.sonarqube": [
+  //   { "serverUrl": "https://sonarqube.your-org.com", "connectionId": "my-sonar" }
+  // ],
+
+  // ---------- Files to hide from explorer (not from Git) --------------------
+  "files.exclude": {
+    "target/": true,
+    ".mvn/": false,
+    "**/.classpath": true,
+    "**/.project": true,
+    "**/.settings": true,
+    "**/.factorypath": true
+  }
+}
