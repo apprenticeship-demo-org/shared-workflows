@@ -16,14 +16,12 @@ Closes #<!-- issue number -->
 -
 
 ## Testing
-- [ ] `npm test` (or equivalent) passes locally
-- [ ] `npx eslint .` passes locally
+- [ ] Tests pass locally
+- [ ] Linting passes locally
 - [ ] Pre-commit hooks pass (`pre-commit run --all-files`)
-- [ ] Coverage is ≥ 80 % (check `coverage/lcov-report/index.html`)
-- [ ] No TypeScript errors (`npx tsc --noEmit` if TypeScript project)
+- [ ] Coverage is ≥ 80 % (check the Actions job summary after pushing)
 
 ## Checklist
 - [ ] I have added / updated tests to cover my changes
-- [ ] I have NOT committed secrets, credentials, or `node_modules/`
-- [ ] `package-lock.json` (or equivalent lock file) is committed
+- [ ] I have NOT committed secrets, credentials, or sensitive data
 - [ ] The CI pipeline passes (check the Actions tab after pushing)

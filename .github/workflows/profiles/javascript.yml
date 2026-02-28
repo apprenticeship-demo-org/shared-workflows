@@ -505,9 +505,11 @@ jobs:
       # Reads Jest/Vitest coverage-summary.json when present and posts a
       # coverage table to the Actions job summary. A ::warning annotation flags
       # coverage below 80 % but does NOT fail the pipeline — SonarQube is the
-      # quality gate. If no coverage file is found the step is a no-op.
+      # quality gate. Skipped entirely when no test runner was detected (avoids
+      # posting 0 % for repos that have not written tests yet) and when the
+      # coverage file shows zero instrumented lines.
       - name: Post coverage summary
-        if: always()
+        if: always() && steps.detect.outputs.test_runner != 'none'
         run: |
           SUMMARY=""
           # Jest writes coverage/coverage-summary.json; Vitest writes the same
@@ -523,7 +525,7 @@ jobs:
 
           export COVERAGE_SUMMARY="$SUMMARY"
           python3 - <<'PYEOF'
-          import json, os
+          import json, os, sys
           with open(os.environ["COVERAGE_SUMMARY"]) as f:
               data = json.load(f)
           totals = data.get("total", {})
@@ -531,8 +533,12 @@ jobs:
           stmts  = totals.get("statements", {}).get("pct", 0)
           funcs  = totals.get("functions",  {}).get("pct", 0)
           branch = totals.get("branches",   {}).get("pct", 0)
+          total_stmts = totals.get("statements", {}).get("total", 0)
+          # Skip if no statements were instrumented — no tests collected
+          if total_stmts == 0:
+              sys.exit(0)
           icon = "🟢" if lines >= 80 else "🟡"
-          flag = "✅ Pass" if lines >= 80 else "⚠️ Below threshold — SonarQube quality gate may fail"
+          flag = "✅ Pass" if lines >= 80 else "⚠️ Below threshold"
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
               f.write(f"## {icon} JavaScript Test Coverage: {lines:.1f}%\n\n")
               f.write("| Metric | Coverage | Threshold | Status |\n")

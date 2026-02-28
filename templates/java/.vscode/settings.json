@@ -17,25 +17,18 @@
   },
 
   // ---------- Checkstyle ----------------------------------------------------
-  "java.checkstyle.configuration": "${workspaceFolder}/.mvn/checkstyle.xml",
+  // Point this at your project's checkstyle config file if you have one:
+  // "java.checkstyle.configuration": "${workspaceFolder}/checkstyle.xml",
   "java.checkstyle.version": "10.17.0",
-  "java.checkstyle.modules": ["com.puppycrawl.tools.checkstyle.checks.naming.*"],
 
-  // ---------- XML (pom.xml) -------------------------------------------------
+  // ---------- XML -----------------------------------------------------------
   "[xml]": {
     "editor.defaultFormatter": "redhat.vscode-xml"
   },
 
-  // ---------- SonarLint -----------------------------------------------------
-  // Connected mode: replace with your actual SonarQube / SonarCloud connection
-  // "sonarlint.connectedMode.connections.sonarqube": [
-  //   { "serverUrl": "https://sonarqube.your-org.com", "connectionId": "my-sonar" }
-  // ],
-
   // ---------- Files to hide from explorer (not from Git) --------------------
   "files.exclude": {
     "target/": true,
-    ".mvn/": false,
     "**/.classpath": true,
     "**/.project": true,
     "**/.settings": true,

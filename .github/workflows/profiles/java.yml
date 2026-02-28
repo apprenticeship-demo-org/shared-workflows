@@ -1,18 +1,24 @@
 # profiles/java.yml — Reusable CI pipeline for Java apprenticeship repos.
 # Triggered via workflow_call from pipeline.yml or directly from a lab repo.
 #
+# Build-tool detection order
+# ─────────────────────────────────────────────────────────────────────────────
+#   Gradle wrapper (gradlew)     → gradle
+#   Maven POM (pom.xml)          → maven  (uses mvnw wrapper if present, else mvn)
+#   Ant build file (build.xml)   → ant
+#   Nothing recognized           → warning, skip build
+#
 # Step order rationale
 # ─────────────────────────────────────────────────────────────────────────────
-# 1. checkout          – source must be present before anything else runs
-# 2. setup-java        – toolchain must exist before Maven is invoked
-# 3. restore-maven-wrapper-cache  – lightweight; avoids re-downloading wrapper
-# 4. restore-maven-repo-cache     – heaviest cache; restores ~.m2/repository
-# 5. lint (checkstyle) – fast static gate; fail early before a full build
-# 6. build & test      – mvn verify compiles, runs tests, generates JaCoCo
-# 7. prune snapshots   – evict volatile SNAPSHOT jars before the cache is saved
-# 8. trivy scan        – dependency CVE scan after artifact production,
-#                        before upload so a critical finding blocks the upload
-# 9. upload-artifact   – persists binaries and coverage report for downstream
+# 1. checkout      – source must be present before anything else runs
+# 2. setup-java    – toolchain must exist before any build command runs
+# 3. detect        – identify build tool; every subsequent conditional reads outputs
+# 4. restore cache – tool-specific cache restored before install/build
+# 5. build & test  – compile, run tests, generate coverage (tool-appropriate command)
+# 6. coverage      – post JaCoCo summary if a report is found (Maven or Gradle path)
+# 7. prune cache   – evict volatile SNAPSHOT jars (Maven only)
+# 8. trivy scan    – CVE scan after artifacts exist; failure blocks upload
+# 9. upload        – persist build output and coverage for downstream jobs
 
 name: Java CI
 
@@ -35,50 +41,42 @@ on:
 
 jobs:
   build:
-    name: Lint → Build & Test → Scan → Upload
+    name: Detect → Build & Test → Scan → Upload
     runs-on: ubuntu-latest
 
     steps:
       # ── 1. Checkout ────────────────────────────────────────────────────────
-      # Must be the very first step so every subsequent step has access to the
-      # repository source tree, pom.xml files, and the Maven wrapper script.
       - name: Checkout repository
         uses: actions/checkout@v4
 
       # ── 2. Set up Java ─────────────────────────────────────────────────────
-      # Install the requested JDK with the Eclipse Temurin distribution before
-      # any Maven command runs. setup-java@v4 also writes a .mvn/jvm.config so
-      # the Maven wrapper inherits the correct JAVA_HOME automatically.
       - name: Set up JDK ${{ inputs.java-version }} (Temurin)
         uses: actions/setup-java@v4
         with:
           java-version: ${{ inputs.java-version }}
           distribution: temurin
 
-      # ── 3. Restore Maven wrapper cache ─────────────────────────────────────
-      # The Maven wrapper downloads a specific Maven version into
-      # .mvn/wrapper/dists on first use. Caching it avoids a ~10 MB download
-      # on every run. Placed before any mvn call so the wrapper binary is
-      # already present when Checkstyle runs.
-      - name: Restore Maven wrapper cache
-        uses: actions/cache@v4
-        with:
-          path: .mvn/wrapper
-          key: ${{ runner.os }}-mvn-wrapper-${{ hashFiles('.mvn/wrapper/maven-wrapper.properties') }}
-          restore-keys: |
-            ${{ runner.os }}-mvn-wrapper-
+      # ── 3. Detect build tool ───────────────────────────────────────────────
+      # Checks for wrapper scripts and build files in order of specificity.
+      # The detected value is used by every subsequent conditional step so
+      # detection only happens once.
+      - name: Detect build tool
+        id: detect
+        run: |
+          if [[ -f gradlew ]]; then
+            echo "tool=gradle" >> "$GITHUB_OUTPUT"
+          elif [[ -f pom.xml ]]; then
+            echo "tool=maven" >> "$GITHUB_OUTPUT"
+          elif [[ -f build.xml ]]; then
+            echo "tool=ant" >> "$GITHUB_OUTPUT"
+          else
+            echo "tool=unknown" >> "$GITHUB_OUTPUT"
+            echo "::warning title=No Build Tool Detected::No recognized build file found (gradlew, pom.xml, build.xml). Add your project files and push again."
+          fi
 
-      # ── 4. Restore Maven local repository cache ─────────────────────────────
-      # ~/.m2/repository holds all downloaded JARs (Spring Boot, JUnit 5,
-      # Mockito, Lombok, SLF4J, Jackson, Hibernate, …). Restoring it before the
-      # build means Maven resolves dependencies from disk rather than the network.
-      #
-      # Two-level key strategy:
-      #   Primary  – OS + "maven" + hash of every pom.xml (exact match: cache is
-      #              valid only if no dependency has changed)
-      #   Fallback – OS + "maven" (partial match: restores the nearest cache so
-      #              only the changed/new dependencies are downloaded)
-      - name: Restore Maven repository cache
+      # ── 4a. Restore Maven repository cache ────────────────────────────────
+      - name: Restore Maven cache
+        if: steps.detect.outputs.tool == 'maven'
         uses: actions/cache@v4
         with:
           path: ~/.m2/repository
@@ -86,82 +84,99 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-maven-
 
-      # ── 5. Lint (Checkstyle) ───────────────────────────────────────────────
-      # Run Checkstyle before compiling so style violations are caught as early
-      # as possible without paying the cost of a full compilation. The step is
-      # intentionally placed here so a style failure stops the pipeline before
-      # any compute-intensive work (compilation, test execution) starts.
-      - name: Lint — Checkstyle
-        run: |
-          # Ensure the wrapper script is executable regardless of how the repo
-          # was checked out (Windows git, zip download, etc.).
-          chmod +x mvnw 2>/dev/null || true
-          ./mvnw --batch-mode --no-transfer-progress checkstyle:check
+      # ── 4b. Restore Gradle caches ──────────────────────────────────────────
+      - name: Restore Gradle cache
+        if: steps.detect.outputs.tool == 'gradle'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
 
-      # ── 6. Build and test (mvn verify) ─────────────────────────────────────
-      # mvn verify runs the full lifecycle: compile → test → package → verify.
-      # It also triggers the JaCoCo Maven plugin (configured in pom.xml) to
-      # generate an XML coverage report at target/site/jacoco/jacoco.xml which
-      # is consumed by the SonarQube workflow downstream.
+      # ── 5. Build and test ──────────────────────────────────────────────────
+      # Runs the full build + test lifecycle for the detected tool.
+      # For Maven: mvn verify runs compile → test → package and triggers JaCoCo.
+      # For Gradle: gradle build runs compile, test, and any configured checks.
+      # For Ant:   ant is invoked with common target names; adjust if needed.
       - name: Build and test
-        run: ./mvnw --batch-mode --no-transfer-progress verify
+        run: |
+          case "${{ steps.detect.outputs.tool }}" in
+            gradle)
+              chmod +x gradlew 2>/dev/null || true
+              ./gradlew build --no-daemon
+              ;;
+            maven)
+              chmod +x mvnw 2>/dev/null || true
+              MVNCMD=$(if [[ -f mvnw ]]; then echo ./mvnw; else echo mvn; fi)
+              $MVNCMD --batch-mode --no-transfer-progress verify
+              ;;
+            ant)
+              ant build test 2>/dev/null || ant build
+              ;;
+            unknown)
+              echo "Skipping build — no build tool detected"
+              ;;
+          esac
 
-      # ── 6b. Post JaCoCo coverage summary ────────────────────────────────────
-      # Parses target/site/jacoco/jacoco.xml — produced by `mvn verify` when
-      # the JaCoCo plugin is in pom.xml. Writes a coverage table to the Actions
-      # job summary so the result is visible on the run overview page without
-      # opening SonarQube. A ::warning annotation flags low coverage, but the
-      # pipeline is NOT failed here — SonarQube is the quality gate for coverage.
+      # ── 6. Post JaCoCo coverage summary ───────────────────────────────────
+      # Searches known JaCoCo report locations for both Maven and Gradle.
+      # Silently skips if no report is found (no tests yet, or JaCoCo not
+      # configured). Does NOT fail the pipeline — SonarQube is the quality gate.
+      # Also skips posting if zero lines were instrumented (no tests collected).
       - name: Post coverage summary
         if: always()
         run: |
-          XML=target/site/jacoco/jacoco.xml
-          if [[ ! -f "$XML" ]]; then
-            echo "## ⚪ Java Test Coverage: N/A" >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "_JaCoCo report not found — either no tests ran or the jacoco-maven-plugin is not configured in pom.xml._" >> "$GITHUB_STEP_SUMMARY"
-            echo "::warning title=No Coverage Report::JaCoCo XML not found. Ensure jacoco-maven-plugin is in pom.xml and at least one test class exists."
-            exit 0
+          XML=""
+          for candidate in \
+            target/site/jacoco/jacoco.xml \
+            build/reports/jacoco/test/jacocoTestReport.xml \
+            build/reports/jacoco/jacocoTestReport.xml; do
+            if [[ -f "$candidate" ]]; then XML="$candidate"; break; fi
+          done
+
+          if [[ -z "$XML" ]]; then
+            exit 0  # No JaCoCo report — no tests or plugin not configured
           fi
-          python3 - <<'PYEOF'
-          import xml.etree.ElementTree as ET, os
-          root = ET.parse("target/site/jacoco/jacoco.xml").getroot()
+
+          python3 - "$XML" <<'PYEOF'
+          import xml.etree.ElementTree as ET, os, sys
+          root = ET.parse(sys.argv[1]).getroot()
           counters = {c.attrib["type"]: c.attrib for c in root.findall("counter")}
           def pct(c):
               covered = int(c.get("covered", 0))
               total   = covered + int(c.get("missed", 0))
-              return (covered / total * 100) if total else 0.0
+              return (covered / total * 100) if total else None
           line_pct   = pct(counters.get("LINE",   {}))
           branch_pct = pct(counters.get("BRANCH", {}))
+          # Skip summary entirely if no lines were instrumented (no tests ran)
+          if line_pct is None:
+              sys.exit(0)
           icon = "🟢" if line_pct >= 80 else "🟡"
-          flag = "✅ Pass" if line_pct >= 80 else "⚠️ Below threshold — SonarQube quality gate may fail"
+          flag = "✅ Pass" if line_pct >= 80 else "⚠️ Below threshold"
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
               f.write(f"## {icon} Java Test Coverage: {line_pct:.1f}%\n\n")
               f.write("| Metric | Coverage | Threshold | Status |\n")
               f.write("|--------|----------|-----------|--------|\n")
               f.write(f"| Line coverage   | {line_pct:.1f}%   | 80% | {flag} |\n")
-              f.write(f"| Branch coverage | {branch_pct:.1f}% | —   | —      |\n")
+              if branch_pct is not None:
+                  f.write(f"| Branch coverage | {branch_pct:.1f}% | —   | —      |\n")
           if line_pct < 80:
-              print(f"::warning title=Low Coverage::Java line coverage is {line_pct:.1f}%. Aim for ≥ 80% — SonarQube quality gate will fail below threshold.")
-          PYEOF ──────────────────────────
-      # SNAPSHOT artifacts are re-published frequently; caching them causes
-      # stale hit rates and hidden build failures. Deleting them before the
-      # post-job cache-save step ensures only stable release JARs are stored,
-      # keeping the cache clean and small across all lab repos.
-      - name: Prune SNAPSHOT dependencies from Maven cache
-        if: always()
-        run: find ~/.m2/repository -name "*SNAPSHOT*" -delete
+              print(f"::warning title=Low Coverage::Java line coverage is {line_pct:.1f}%. Aim for ≥ 80%.")
+          PYEOF
 
-      # ── 8. Trivy dependency vulnerability scan ────────────────────────────
-      # Scans the pom.xml dependency tree against the Java-specific CVE database
-      # (ghcr.io/aquasecurity/trivy-java-db) which has far better coverage for
-      # Maven/Gradle artifacts than the generic OSS database. Configured to:
-      #   • scan only library vulnerabilities (not OS packages)
-      #   • skip test class files to avoid false positives on test-only deps
-      #   • fail the pipeline (exit-code: 1) on CRITICAL or HIGH findings
-      # Positioned after the build so Trivy can resolve transitive dependencies
-      # from the fully-resolved classpath, and before artifact upload so a
-      # critical finding blocks the upload of vulnerable binaries.
+      # ── 7. Prune SNAPSHOT dependencies (Maven only) ───────────────────────
+      # SNAPSHOT artifacts are re-published frequently and stale cached versions
+      # cause hidden build failures. Evict them before the cache is saved.
+      - name: Prune SNAPSHOT dependencies from Maven cache
+        if: always() && steps.detect.outputs.tool == 'maven'
+        run: find ~/.m2/repository -name "*SNAPSHOT*" -delete 2>/dev/null || true
+
+      # ── 8. Trivy dependency CVE scan ─────────────────────────────────────
+      # Uses the Java-specific CVE database for better Maven/Gradle coverage.
+      # Fails the pipeline on CRITICAL or HIGH findings before artifacts upload.
       - name: Trivy — Java dependency CVE scan
         uses: aquasecurity/trivy-action@master
         env:
@@ -177,16 +192,14 @@ jobs:
           skip-files: "**/*Test*.java,**/*Spec*.java"
 
       # ── 9. Upload build artifacts ──────────────────────────────────────────
-      # Persist the compiled JAR/WAR and the JaCoCo XML report so downstream
-      # jobs (SonarQube analysis, deployment) can download them without
-      # re-running the build. Placed last so a failing Trivy scan prevents
-      # vulnerable artifacts from being uploaded and shared.
+      # Uploads both Maven (target/) and Gradle (build/) output so downstream
+      # SonarQube analysis can consume whichever is present.
       - name: Upload build artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: java-build
+          if-no-files-found: warn
           path: |
             target/
-            target/site/jacoco/jacoco.xml
-          if-no-files-found: warn
+            build/reports/

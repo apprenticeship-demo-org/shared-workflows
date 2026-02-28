@@ -33,32 +33,30 @@ repos:
     hooks:
       - id: detect-secrets
         args: [--baseline, .secrets.baseline]
-        exclude: package-lock\.json
 
   # ---------------------------------------------------------------------------
-  # Prettier — formatter (mirrors CI step)
-  # Requires node / npm installed locally
+  # Add your project's linter and formatter hooks below.
+  # These depend on which tools your project uses, so we leave them to you.
+  #
+  # Examples (uncomment and adapt as needed):
+  #
+  # Prettier (requires prettier in your project's devDependencies):
+  #   - repo: local
+  #     hooks:
+  #       - id: prettier
+  #         name: Prettier
+  #         language: node
+  #         entry: npx prettier --write
+  #         types_or: [javascript, jsx, ts, tsx, json, css, markdown]
+  #         additional_dependencies: [prettier]
+  #
+  # ESLint (requires eslint in your project's devDependencies):
+  #   - repo: local
+  #     hooks:
+  #       - id: eslint
+  #         name: ESLint
+  #         language: system
+  #         entry: npx eslint --fix
+  #         types_or: [javascript, jsx, ts, tsx]
+  #         pass_filenames: true
   # ---------------------------------------------------------------------------
-  - repo: local
-    hooks:
-      - id: prettier
-        name: Prettier
-        language: node
-        entry: npx prettier --write
-        types_or: [javascript, jsx, ts, tsx, json, css, markdown]
-        additional_dependencies:
-          - prettier@3.3.2
-
-  # ---------------------------------------------------------------------------
-  # ESLint — linter (mirrors CI step)
-  # Requires: npm install already run in the repo
-  # ---------------------------------------------------------------------------
-  - repo: local
-    hooks:
-      - id: eslint
-        name: ESLint
-        language: system
-        entry: bash -c 'npx eslint --fix "$@"' --
-        types_or: [javascript, jsx, ts, tsx]
-        pass_filenames: true
-        stages: [pre-commit]

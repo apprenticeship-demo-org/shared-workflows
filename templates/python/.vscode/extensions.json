@@ -2,19 +2,15 @@
   "recommendations": [
     // Python language support + IntelliSense
     "ms-python.python",
-    // Pylance: fast type checking and completions
+    // Pylance: fast type inference and completions
     "ms-python.pylance",
-    // SonarLint: real-time code quality analysis matching SonarQube server rules
+    // SonarLint: flags issues inline before you push
     "SonarSource.sonarlint-vscode",
     // Black formatter integration
     "ms-python.black-formatter",
     // isort: import sorting on save
     "ms-python.isort",
     // Flake8 linter integration
-    "ms-python.flake8",
-    // GitLens: rich Git history / blame annotations
-    "eamodio.gitlens",
-    // Markdown linting for docs
-    "DavidAnson.vscode-markdownlint"
+    "ms-python.flake8"
   ]
 }

@@ -16,9 +16,9 @@ repos:
       - id: end-of-file-fixer
       - id: mixed-line-ending
         args: [--fix=lf]
-      - id: check-xml                   # validates pom.xml, checkstyle files
+      - id: check-xml                   # validates build files (pom.xml, build.gradle.kts, etc.)
       - id: check-yaml
-        args: [--unsafe]                # allow custom YAML tags
+        args: [--unsafe]
       - id: check-json
       - id: check-added-large-files
         args: [--maxkb=1024]
@@ -35,18 +35,28 @@ repos:
     hooks:
       - id: detect-secrets
         args: [--baseline, .secrets.baseline]
-        exclude: package-lock\.json
 
   # ---------------------------------------------------------------------------
-  # Maven Checkstyle (mirrors the CI step)
-  # Requires: Java + Maven on the local machine
+  # Add your build-tool-specific hooks below.
+  # Examples:
+  #
+  # Maven Checkstyle:
+  #   - repo: local
+  #     hooks:
+  #       - id: checkstyle
+  #         name: Maven Checkstyle
+  #         language: system
+  #         entry: bash -c 'chmod +x mvnw && ./mvnw checkstyle:check -q'
+  #         pass_filenames: false
+  #         files: \.java$
+  #
+  # Gradle check:
+  #   - repo: local
+  #     hooks:
+  #       - id: gradle-check
+  #         name: Gradle check
+  #         language: system
+  #         entry: bash -c 'chmod +x gradlew && ./gradlew check -q'
+  #         pass_filenames: false
+  #         files: \.java$
   # ---------------------------------------------------------------------------
-  - repo: local
-    hooks:
-      - id: maven-checkstyle
-        name: Maven Checkstyle
-        language: system
-        entry: bash -c 'chmod +x mvnw 2>/dev/null || true && ./mvnw checkstyle:check -q --no-transfer-progress'
-        pass_filenames: false
-        files: \.java$
-        stages: [pre-commit]

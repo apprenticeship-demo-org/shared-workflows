@@ -34,12 +34,6 @@
     "typescriptreact"
   ],
 
-  // ---------- SonarLint -----------------------------------------------------
-  // Connected mode: replace with your actual SonarQube / SonarCloud connection
-  // "sonarlint.connectedMode.connections.sonarqube": [
-  //   { "serverUrl": "https://sonarqube.your-org.com", "connectionId": "my-sonar" }
-  // ],
-
   // ---------- Files to hide from explorer -----------------------------------
   "files.exclude": {
     "node_modules/": true,

@@ -17,15 +17,10 @@ Closes #<!-- issue number -->
 -
 
 ## Validation
-- [ ] `yamllint .` passes locally
-- [ ] `terraform fmt -recursive` applied
-- [ ] `terraform validate` passes locally
-- [ ] `tflint --recursive` passes locally
-- [ ] `helm lint` passes locally (if Helm changes)
+- [ ] Relevant linting tools pass locally (yamllint, hadolint, terraform validate, helm lint, …)
 - [ ] Pre-commit hooks pass (`pre-commit run --all-files`)
 - [ ] No hardcoded secrets or credentials
 
 ## Checklist
-- [ ] Terraform state backend is NOT configured locally (CI uses `-backend=false`)
 - [ ] I have NOT committed `.terraform/`, `.tfstate`, or secrets
 - [ ] The CI pipeline passes (check the Actions tab after pushing)
