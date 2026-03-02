@@ -22,6 +22,12 @@ on:
       - '.trivyignore'
       - '.gitignore'
 
+# Permissions required by the shared-workflows pipeline chain.
+# security-events: write is needed for Trivy SARIF upload to the Security tab.
+permissions:
+  contents: read
+  security-events: write
+
 jobs:
   pipeline:
     # ── Replace <YOUR-ORG> with your GitHub organisation name ──────────────

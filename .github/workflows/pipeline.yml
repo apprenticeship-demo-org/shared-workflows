@@ -44,6 +44,13 @@ on:
       SONAR_TOKEN:
         required: false
 
+# Permissions required by nested reusable workflows in the chain.
+# These must be declared here so the top-level caller can grant them.
+# Permissions can only flow downward — they cannot be elevated.
+permissions:
+  contents: read
+  security-events: write
+
 jobs:
 
   # ── 1. Detect profile ──────────────────────────────────────────────────────
