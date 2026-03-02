@@ -48,8 +48,9 @@ on:
 # These must be declared here so the top-level caller can grant them.
 # Permissions can only flow downward — they cannot be elevated.
 permissions:
-  contents: read
-  security-events: write
+  contents: write        # copilot-review: commit copilot-instructions.md
+  pull-requests: write   # copilot-review: assign @copilot as reviewer
+  security-events: write # trivy: upload SARIF to the Security tab
 
 jobs:
 

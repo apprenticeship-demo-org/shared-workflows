@@ -1,6 +1,18 @@
-# shared/copilot-review.yml — Reusable GitHub Copilot code-review workflow.
-# Posts automated PR review comments powered by GitHub Copilot.
-# Called by profile workflows on pull_request events.
+# copilot-review.yml — Reusable workflow: automated Copilot PR review setup.
+#
+# What it does (in order):
+#   1. Skips entirely if .github/copilot-instructions.md already exists
+#      (idempotent — safe to call on every PR).
+#   2. Searches the repository root for a .pdf file (lab brief / spec).
+#      If none is found, exits gracefully without creating anything.
+#   3. Extracts the PDF text with pdftotext (poppler-utils) and builds a
+#      professional system-prompt persona that defines Copilot as a
+#      'Senior Software Engineer Lead' whose review guidance is anchored
+#      to the content of the PDF.
+#   4. Commits .github/copilot-instructions.md back to the PR branch.
+#   5. Assigns @copilot as a reviewer on the current Pull Request.
+#
+# Called by pipeline.yml on pull_request events only (never on push).
 
 on:
   workflow_call:
@@ -9,21 +21,190 @@ on:
         description: "Review verbosity: summary | detailed"
         required: false
         type: string
-        default: "summary"
+        default: "detailed"
+
 jobs:
-  copilot-review:
-    name: AI Code Review
+  copilot-setup:
+    name: Setup Copilot Instructions
     runs-on: ubuntu-latest
+
+    # Permissions required for this job:
+    #   contents: write      — commit .github/copilot-instructions.md to the branch
+    #   pull-requests: write — assign @copilot as reviewer via gh pr edit
+    # These must also be granted by the top-level caller (pipeline.yml + ci.yml).
+    permissions:
+      contents: write
+      pull-requests: write
+
     steps:
-      - name: AI review coming soon
+
+      # ── 1. Checkout the PR branch (with write credentials) ──────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      # ── 2. Idempotency guard ─────────────────────────────────────────────────
+      - name: Check if copilot-instructions.md already exists
+        id: guard
         run: |
-          echo "::notice title=AI Review::🤖 AI-powered code review is coming soon! Stay tuned."
-          echo ""
-          echo "  ┌─────────────────────────────────────────────────┐"
-          echo "  │  🤖  AI Code Review — Coming Soon               │"
-          echo "  │                                                 │"
-          echo "  │  Automated PR reviews powered by GitHub         │"
-          echo "  │  Copilot will appear here in a future update.   │"
-          echo "  │                                                 │"
-          echo "  │  Review level requested: ${{ inputs.review-level }}"
-          echo "  └─────────────────────────────────────────────────┘"
+          if [[ -f ".github/copilot-instructions.md" ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Copilot Setup::copilot-instructions.md already exists — skipping setup."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── 3. Install PDF extraction tool ──────────────────────────────────────
+      - name: Install poppler-utils
+        if: steps.guard.outputs.skip == 'false'
+        run: sudo apt-get install -y --quiet poppler-utils 2>/dev/null
+
+      # ── 4. Locate PDF and extract text ──────────────────────────────────────
+      - name: Extract PDF content
+        if: steps.guard.outputs.skip == 'false'
+        id: pdf
+        run: |
+          # Find the first .pdf at the repo root (non-recursive)
+          PDF_FILE=$(find . -maxdepth 1 -name "*.pdf" -type f | head -1)
+
+          if [[ -z "$PDF_FILE" ]]; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Copilot Setup::No PDF found at repo root — skipping copilot-instructions.md creation."
+            exit 0
+          fi
+
+          echo "found=true"  >> "$GITHUB_OUTPUT"
+          echo "path=$PDF_FILE" >> "$GITHUB_OUTPUT"
+          echo "::notice title=Copilot Setup::Found PDF: $PDF_FILE"
+
+          # Extract text — suppress warnings, fall back gracefully on failure
+          EXTRACTED=$(pdftotext "$PDF_FILE" - 2>/dev/null || true)
+
+          if [[ -z "$EXTRACTED" ]]; then
+            echo "::warning title=Copilot Setup::PDF text extraction produced no output. The file may be image-only."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Trim to 6000 chars to stay well within model context budgets
+          TRIMMED="${EXTRACTED:0:6000}"
+
+          # Write to a temp file so the next step can read it safely without
+          # worrying about shell quoting or special characters in the content
+          printf '%s' "$TRIMMED" > /tmp/pdf_extracted.txt
+
+      # ── 5. Generate .github/copilot-instructions.md ─────────────────────────
+      - name: Generate copilot-instructions.md
+        if: steps.guard.outputs.skip == 'false' && steps.pdf.outputs.found == 'true'
+        run: |
+          REVIEW_LEVEL="${{ inputs.review-level }}"
+          PDF_PATH="${{ steps.pdf.outputs.path }}"
+          PDF_CONTENT=$(cat /tmp/pdf_extracted.txt)
+          REPO="${{ github.repository }}"
+          BRANCH="${{ github.head_ref }}"
+          TODAY=$(date -u +"%Y-%m-%d")
+
+          mkdir -p .github
+
+          cat > .github/copilot-instructions.md <<PERSONA
+          # GitHub Copilot — Review Instructions
+          <!-- Auto-generated by copilot-review.yml on ${TODAY} -->
+          <!-- Source: ${PDF_PATH} | Repo: ${REPO} | Branch: ${BRANCH} -->
+
+          ## Persona
+
+          You are a **Senior Software Engineer Lead** conducting a structured code review
+          for an apprenticeship training programme. Your reviews must be:
+
+          - **Pedagogical** — explain *why* something is wrong, not just *what* is wrong.
+          - **Constructive** — always pair a critique with a concrete suggestion or example.
+          - **Aligned** — all feedback must reference the project requirements extracted
+            from the lab brief below. If a piece of code cannot be evaluated against the
+            brief, state that explicitly rather than inventing criteria.
+          - **Consistent** — apply the same standard to every file, every contributor.
+
+          Review verbosity level: **${REVIEW_LEVEL}**
+          $(if [[ "$REVIEW_LEVEL" == "summary" ]]; then
+            echo "Provide a concise summary with the top 3 actionable findings only."
+          else
+            echo "Provide a full line-by-line analysis grouped by: Correctness, Code Quality, Security, Test Coverage, and Alignment to Brief."
+          fi)
+
+          ---
+
+          ## Project Brief (extracted from \`${PDF_PATH}\`)
+
+          > The following content was automatically extracted from the lab PDF.
+          > Use it as the authoritative source of requirements when evaluating
+          > whether the submitted code meets the expected objectives.
+
+          \`\`\`
+          ${PDF_CONTENT}
+          \`\`\`
+
+          ---
+
+          ## Review Checklist
+
+          When reviewing a pull request in this repository, always verify:
+
+          1. **Functionality** — Does the implementation satisfy each requirement listed above?
+          2. **Code quality** — Are naming, structure, and formatting consistent and idiomatic?
+          3. **Error handling** — Are edge cases and failure paths properly handled?
+          4. **Test coverage** — Are the critical paths covered by automated tests?
+          5. **Security** — Are there any obvious vulnerabilities (hardcoded secrets, injection risks, etc.)?
+          6. **Documentation** — Are public methods and non-obvious logic documented?
+
+          For each finding, use the format:
+
+          > **[Severity: Critical | Major | Minor | Suggestion]**
+          > *File*: \`path/to/file.ext\` — Line X
+          > *Issue*: description
+          > *Recommendation*: what to do instead, with a code snippet if helpful
+
+          ---
+
+          *This file is managed by the shared CI pipeline. Do not edit manually —
+          re-running the Copilot Setup job will not overwrite it once it exists.*
+          PERSONA
+
+          echo "::notice title=Copilot Setup::Generated .github/copilot-instructions.md successfully."
+
+      # ── 6. Commit the generated file back to the PR branch ──────────────────
+      - name: Commit copilot-instructions.md
+        if: steps.guard.outputs.skip == 'false' && steps.pdf.outputs.found == 'true'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add .github/copilot-instructions.md
+
+          # Only commit if there is actually something staged
+          if git diff --cached --quiet; then
+            echo "::notice title=Copilot Setup::Nothing to commit — file was already up to date."
+            exit 0
+          fi
+
+          git commit -m "ci: add .github/copilot-instructions.md [skip ci]
+
+          Auto-generated by copilot-review.yml from the lab PDF.
+          Defines Copilot persona and review checklist aligned to the project brief."
+
+          git push origin HEAD:"${{ github.head_ref }}"
+
+      # ── 7. Assign @copilot as PR reviewer ───────────────────────────────────
+      - name: Assign Copilot as reviewer
+        if: steps.guard.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # gh pr edit --add-reviewer accepts a login or the special @copilot handle.
+          # Failures are swallowed — if the org does not have Copilot code review
+          # enabled, this is a no-op rather than a pipeline blocker.
+          gh pr edit "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" \
+            --add-reviewer "copilot" 2>/dev/null || \
+            echo "::warning title=Copilot Review::Could not assign @copilot as reviewer. Ensure GitHub Copilot code review is enabled for this organisation."

@@ -21,14 +21,14 @@
 4. [Repository layout](#4-repository-layout)
 5. [Job execution graph](#5-job-execution-graph)
 6. [pipeline.yml — the central orchestrator](#6-pipelineyml)
-7. [profiles/java.yml](#7-profilesjavayml)
-8. [profiles/python.yml](#8-profilespythonyml)
-9. [profiles/javascript.yml](#9-profilesjavascriptyml)
-10. [profiles/devops.yml](#10-profilesdevopsyml)
-11. [shared/cache-warmer.yml](#11-sharedcache-warmeryml)
-12. [shared/trivy.yml](#12-sharedtrivyyml)
-13. [shared/sonarqube.yml](#13-sharedsonarqubeyml)
-14. [shared/copilot-review.yml](#14-sharedcopilot-reviewyml)
+7. [java.yml — Java profile](#7-javayml)
+8. [python.yml — Python profile](#8-pythonyml)
+9. [javascript.yml — JavaScript profile](#9-javascriptyml)
+10. [devops.yml — DevOps profile](#10-devopsyml)
+11. [cache-warmer.yml](#11-cache-warmeryml)
+12. [trivy.yml](#12-trivyyml)
+13. [sonarqube.yml](#13-sonarqubeyml)
+14. [copilot-review.yml](#14-copilot-reviewyml)
 15. [Caching architecture](#15-caching-architecture)
 16. [Security scanning architecture](#16-security-scanning-architecture)
 17. [Inputs reference](#17-inputs-reference)
@@ -117,21 +117,28 @@ This regex extracts the bare value after `profile: ` without any shell variable 
 
 ## 4. Repository layout
 
+> **Note:** All workflow files live at the top level of `.github/workflows/`.
+> GitHub does not support reusable workflows in subdirectories.
+
 ```
 .github/
 └── workflows/
-    ├── pipeline.yml              ← Entry point — read profile → warm caches → run profile → shared gates
-    ├── profiles/
-    │   ├── java.yml              ← Java CI: lint → build → test → scan → upload
-    │   ├── python.yml            ← Python CI: lint → install → test → scan → upload
-    │   ├── javascript.yml        ← JS/TS CI: detect → install → lint → build → test → scan → upload
-    │   └── devops.yml            ← DevOps CI: YAML → Dockerfile → Terraform → Helm → Jenkinsfile
-    └── shared/
-        ├── cache-warmer.yml      ← Pre-populate caches before the profile job runs
-        ├── trivy.yml             ← SARIF upload to Security tab + Dockerfile CVE scanning
-        ├── sonarqube.yml         ← SonarQube/SonarCloud analysis + quality gate
-        └── copilot-review.yml    ← GitHub Copilot automated PR review (placeholder)
-ci-profile.yml                    ← NOT in this repo — lives in each lab repo
+    ├── pipeline.yml          ← Entry point — read profile → warm caches → run profile → shared gates
+    ├── java.yml              ← Java CI: lint → build → test → scan → upload
+    ├── python.yml            ← Python CI: lint → install → test → scan → upload
+    ├── javascript.yml        ← JS/TS CI: detect → install → lint → build → test → scan → upload
+    ├── devops.yml            ← DevOps CI: YAML → Dockerfile → Terraform → Helm → Jenkinsfile
+    ├── cache-warmer.yml      ← Pre-populate caches before the profile job runs
+    ├── trivy.yml             ← SARIF upload to Security tab + Dockerfile CVE scanning
+    ├── sonarqube.yml         ← SonarQube/SonarCloud analysis + quality gate
+    └── copilot-review.yml    ← Automated PDF→persona generation + Copilot reviewer assignment
+templates/
+    ├── devops/               ← Ready-to-copy starter files for the devops profile
+    ├── java/                 ← Ready-to-copy starter files for the java profile
+    ├── javascript/           ← Ready-to-copy starter files for the javascript profile
+    └── python/               ← Ready-to-copy starter files for the python profile
+setup-org-templates.sh        ← Script to instantiate and push all four templates to a GitHub org
+ci-profile.yml                ← NOT in this repo — lives in each lab repo root
 ```
 
 ---
@@ -203,7 +210,7 @@ java:
 
 ---
 
-## 7. `profiles/java.yml`
+## 7. `java.yml`
 
 **Role:** Full Java CI — lint → Maven build + test → SNAPSHOT pruning → CVE scan → artifact upload.
 
@@ -241,7 +248,7 @@ Restore keys (fallback to nearest snapshot):
 
 ---
 
-## 8. `profiles/python.yml`
+## 8. `python.yml`
 
 **Role:** Full Python CI — lint → install → CVE scan → test with coverage → artifact upload.
 
@@ -279,7 +286,7 @@ Layer 1 is always populated by `setup-python`. Layers 2 and 3 only hit when the 
 
 ---
 
-## 9. `profiles/javascript.yml`
+## 9. `javascript.yml`
 
 **Role:** Single profile covering every JavaScript/TypeScript frontend stack through automatic detection.
 
@@ -327,7 +334,7 @@ A single bash step (Step 3) outputs seven values to `GITHUB_OUTPUT`. Every subse
 
 ---
 
-## 10. `profiles/devops.yml`
+## 10. `devops.yml`
 
 **Role:** Validation-only pipeline for IaC repos. There are intentionally no build or unit test steps — linting and validation *are* the quality gates for infrastructure code.
 
@@ -370,7 +377,7 @@ Lab repos do not have access to remote Terraform backends (S3, Azure Blob, GCS).
 
 ---
 
-## 11. `shared/cache-warmer.yml`
+## 11. `cache-warmer.yml`
 
 **Role:** Runs *before* the profile job in `pipeline.yml` to pre-populate every Actions cache the profile will later restore.
 
@@ -433,7 +440,7 @@ An `if: always()` step at the end prints `HIT`, `WARMED`, or `SKIP` for each cac
 
 ---
 
-## 12. `shared/trivy.yml`
+## 12. `trivy.yml`
 
 **Role:** SARIF upload to the GitHub Security tab. This is *not* the pipeline-failing scan — that runs inside each profile workflow.
 
@@ -503,7 +510,7 @@ These are declared on the `trivy-sarif` job rather than at workflow level so cal
 
 ---
 
-## 13. `shared/sonarqube.yml`
+## 13. `sonarqube.yml`
 
 **Role:** SonarQube / SonarCloud code quality analysis with quality gate polling.
 
@@ -576,15 +583,43 @@ The host URL can be supplied either as an org-level secret (preferred for self-h
 
 ---
 
-## 14. `shared/copilot-review.yml`
+## 14. `copilot-review.yml`
 
-**Role:** GitHub Copilot automated PR review.
+**Role:** Automated Copilot PR review setup — generates a scoped system-prompt persona from the lab PDF and assigns `@copilot` as a PR reviewer.
 
-Currently a placeholder — the `workflow_call` trigger and `review-level` input are defined, but job logic has not yet been implemented.
+**Triggered only on `pull_request` events** (never on `push`).
+
+### What it does (in order)
+
+| Step | Description |
+|------|-------------|
+| 1. Idempotency guard | If `.github/copilot-instructions.md` already exists, terminate gracefully. Safe to call on every PR. |
+| 2. PDF discovery | Searches the **repository root** (non-recursive) for any `.pdf` file. If none found, exits without creating anything. |
+| 3. Text extraction | Installs `poppler-utils` and runs `pdftotext`. If extraction yields no text (image-only PDF), exits gracefully. Content is trimmed to 6 000 characters. |
+| 4. Persona generation | Writes `.github/copilot-instructions.md` with a **Senior Software Engineer Lead** persona whose review criteria are anchored to the extracted PDF content. Includes a structured review checklist with severity levels. |
+| 5. Commit back | Commits the generated file to the PR branch as `github-actions[bot]` with `[skip ci]` in the message. |
+| 6. Assign reviewer | Calls `gh pr edit --add-reviewer copilot` to assign `@copilot` to the PR. Failures are swallowed — if Copilot code review is not enabled for the org, this step is a no-op. |
+
+### Inputs
 
 | Input | Default | Description |
 |-------|---------|-------------|
-| `review-level` | `summary` | `summary` or `detailed` |
+| `review-level` | `detailed` | `summary` — top 3 findings only. `detailed` — full line-by-line analysis grouped by Correctness, Code Quality, Security, Test Coverage, and Alignment to Brief. |
+
+### Permissions required
+
+| Permission | Reason |
+|------------|--------|
+| `contents: write` | Commit `.github/copilot-instructions.md` back to the PR branch |
+| `pull-requests: write` | Assign `@copilot` as a reviewer via `gh pr edit` |
+
+These permissions are declared on the job in `copilot-review.yml` **and** must be granted by every workflow in the call chain above it (`pipeline.yml` and the lab repo's `ci.yml`).
+
+### Prerequisites
+
+- A `.pdf` file must be present at the **root** of the lab repository (not in a subdirectory). This is the lab brief / project specification document.
+- **GitHub Copilot code review** must be enabled for the organisation: _Org Settings → Copilot → Policies → Code review_. Without this, Step 6 will warn and continue — the instructions file is still generated.
+- No additional secrets are required — `GITHUB_TOKEN` (auto-provided) is sufficient.
 
 ---
 
@@ -730,41 +765,143 @@ Layer 1 and Layer 2 scan the **same files** (the repo source tree) but produce d
 
 ## 18. Secrets reference
 
-| Secret | Required by | Description |
-|--------|-------------|-------------|
-| `SONAR_TOKEN` | `sonarqube.yml` | SonarQube / SonarCloud API token |
-| `SONAR_HOST_URL` | `sonarqube.yml` | Optional: self-hosted SonarQube server URL |
+| Secret | Required by | Where to set | Description |
+|--------|-------------|--------------|-------------|
+| `SONAR_TOKEN` | `sonarqube.yml` | Org or repo secret | SonarQube / SonarCloud API token. Generate from _SonarCloud → My Account → Security → Generate Token_. |
+| `SONAR_HOST_URL` | `sonarqube.yml` | Org or repo secret | Only required for **self-hosted** SonarQube. Omit for SonarCloud (defaults to `https://sonarcloud.io`). |
+| `GITHUB_TOKEN` | `trivy.yml`, `copilot-review.yml` | Auto-provided | Automatically injected by GitHub Actions — no setup required. Must not be restricted to read-only (see Section 19). |
 
 ### How to set up secrets
 
-1. Go to **Settings → Secrets and variables → Actions** in the lab repository (or at org level for shared secrets)
-2. Click **New repository secret** (or **New organization secret**)
-3. Add `SONAR_TOKEN` with the token from your SonarQube / SonarCloud account
+1. Go to **Settings → Secrets and variables → Actions** in the organisation (recommended) or in each lab repository.
+2. Click **New organization secret** → set **Repository access** to _All repositories_ (or specific repos).
+3. Add the following:
+
+```
+SORAR_TOKEN      = <token from SonarCloud → My Account → Security>
+SORAR_HOST_URL   = https://sonarcloud.io   # or your self-hosted URL
+```
 
 Because `pipeline.yml` uses `secrets: inherit`, all secrets available in the calling repository are automatically forwarded to every called workflow — you do not need to enumerate them explicitly.
+
+### Environment variables (internal — no setup required)
+
+| Variable | Set by | Used in | Description |
+|----------|--------|---------|-------------|
+| `GITHUB_TOKEN` | GitHub Actions runtime | `trivy.yml`, `copilot-review.yml` | Short-lived token scoped to the current run. Permissions controlled by the `permissions:` block in each workflow. |
+| `GH_TOKEN` | Set from `secrets.GITHUB_TOKEN` | `copilot-review.yml` | Alias consumed by the `gh` CLI for `gh pr edit`. |
 
 ---
 
 ## 19. Repository access control setup
 
-### Making workflows accessible to lab repos
+### 1. Grant org-level access to this repo's workflows
 
-This repository must be set to **internal** (for org-owned private repos) or **public** so that lab repos in the same organisation can reference its workflows.
+`shared-workflows` can remain **private**. GitHub's _Actions access level_ setting controls which repos may call its workflows independently of visibility.
 
-1. **Settings → General → Danger Zone → Change repository visibility** → set to `Internal` or `Public`
+Run once after creating or re-creating `shared-workflows` in the org:
 
-### Restricting which repositories can call these workflows
+```bash
+gh api --method PUT /repos/<org>/shared-workflows/actions/permissions/access \
+  --field access_level=organization
+```
 
-1. **Settings → Actions → General → Access policy**
-2. Select **"Accessible from repositories in the `<org>` organization"**
+This allows any repository inside the organisation to call reusable workflows from `shared-workflows` without making the repo public.
 
-This prevents workflows in repositories outside the org from calling into your shared pipeline.
+> **Why not `internal` visibility?** Repository visibility and Actions access level are separate settings. A `private` repo with `access_level=organization` is equivalent to `internal` for the purposes of reusable workflows — and does not require GitHub Enterprise.
 
-### Grant workflow token write permissions
+### 2. Workflow permissions in lab repos
 
-For `shared/trivy.yml` to upload SARIF to the Security tab, the `GITHUB_TOKEN` in each lab repo needs `security-events: write`. The `trivy-sarif` job declares this permission explicitly, but the calling repo must not restrict `GITHUB_TOKEN` permissions to read-only.
+Each lab repo's `GITHUB_TOKEN` must be allowed to write contents and security events. The `ci.yml` template declares:
 
-Check: **Settings → Actions → General → Workflow permissions** → set to **"Read and write permissions"** (or use fine-grained token permissions).
+```yaml
+permissions:
+  contents: read
+  security-events: write
+```
+
+And `pipeline.yml` declares the full set required by its called workflows:
+
+```yaml
+permissions:
+  contents: write
+  security-events: write
+  pull-requests: write
+```
+
+If your organisation enforces **read-only** as the default `GITHUB_TOKEN` policy, these declarations override it at the workflow level — no org-wide change is needed.
+
+### 3. Fix the org ruleset for template-based repo creation
+
+If your organisation has a branch ruleset with `required_status_checks` **and** `do_not_enforce_on_create: false`, creating a repo from a template will fail because no CI has run yet.
+
+Fix with:
+
+```bash
+# Get the ruleset ID
+gh api /orgs/<org>/rulesets --jq '.[] | {id, name}'
+
+# Patch do_not_enforce_on_create
+gh api --method PUT /orgs/<org>/rulesets/<id> \
+  --input - <<'EOF'
+{
+  "name": "default-branch-protection",
+  "target": "branch",
+  "enforcement": "active",
+  "conditions": {
+    "ref_name": { "include": ["~DEFAULT_BRANCH"], "exclude": [] },
+    "repository_name": { "include": ["~ALL"], "exclude": [], "protected": false }
+  },
+  "rules": [
+    {
+      "type": "pull_request",
+      "parameters": {
+        "allowed_merge_methods": ["merge", "squash", "rebase"],
+        "dismiss_stale_reviews_on_push": true,
+        "require_code_owner_review": true,
+        "require_last_push_approval": true,
+        "required_approving_review_count": 1,
+        "required_review_thread_resolution": true,
+        "required_reviewers": []
+      }
+    },
+    {
+      "type": "required_status_checks",
+      "parameters": {
+        "required_status_checks": [{ "context": "~ALL" }],
+        "strict_required_status_checks_policy": true,
+        "do_not_enforce_on_create": true
+      }
+    },
+    { "type": "deletion" }
+  ]
+}
+EOF
+```
+
+### 4. Enable Copilot code review (optional)
+
+To have `@copilot` automatically assigned as a reviewer on pull requests:
+
+1. Go to **Org Settings → Copilot → Policies**
+2. Enable **Code review**
+
+Without this, `copilot-review.yml` still generates `.github/copilot-instructions.md` but logs a warning instead of assigning the reviewer.
+
+### 5. Verify the setup
+
+```bash
+# Confirm access level
+gh api /repos/<org>/shared-workflows/actions/permissions/access --jq '.access_level'
+# Expected: "organization"
+
+# List template repos
+gh repo list <org> --limit 20 --json name,isTemplate --jq '.[] | select(.isTemplate)'
+
+# Confirm template flag on one repo
+gh api /repos/<org>/template-java --jq '.is_template'
+# Expected: true
+```
 
 ---
 
@@ -773,25 +910,26 @@ Check: **Settings → Actions → General → Workflow permissions** → set to 
 ### Adding a step to an existing profile
 
 1. Branch off `main`
-2. Edit the relevant `profiles/*.yml` or `shared/*.yml`
-3. If you add a new cache, add the matching key to `shared/cache-warmer.yml`
+2. Edit the relevant profile workflow (e.g. `java.yml`) or shared workflow (e.g. `trivy.yml`) — all files are at the top level of `.github/workflows/`
+3. If you add a new cache, add the matching key to `cache-warmer.yml`
 4. Open a pull request — Copilot review will post automated feedback
 5. A maintainer merges after review
 
 ### Adding a new profile
 
-1. Create `profiles/<name>.yml` following the same structure as the existing profiles
+1. Create `.github/workflows/<name>.yml` at the top level (subdirectories are not supported by GitHub for reusable workflows)
 2. Add a new job in `pipeline.yml`:
    ```yaml
    <name>:
      needs: [read-profile, cache-warmer]
      if: needs.read-profile.outputs.profile == '<name>'
-     uses: ./.github/workflows/profiles/<name>.yml
+     uses: ./.github/workflows/<name>.yml
      secrets: inherit
    ```
-3. Update the trivy/sonarqube/copilot-review `needs:` arrays to include `<name>`
-4. Add warm-up logic to `shared/cache-warmer.yml` for the new profile
-5. Update the profile table in the [ci-profile.yml contract](#3-ci-profileyml-contract) section of this README
+3. Update the `trivy`, `sonarqube`, and `copilot-review` `needs:` arrays to include `<name>`
+4. Add warm-up logic to `cache-warmer.yml` for the new profile
+5. Add a `templates/<name>/` directory with `ci-profile.yml` and `.github/workflows/ci.yml`
+6. Update the profile table in the [ci-profile.yml contract](#3-ci-profileyml-contract) section of this README
 
 ### Versioning
 
@@ -815,7 +953,55 @@ act push -W .github/workflows/pipeline.yml \
 
 ## 21. Lab repository templates
 
-The `templates/` directory contains ready-to-use starter files for each profile. Copy the contents of the relevant profile folder into a new lab repository to get a working CI pipeline with zero configuration.
+The `templates/` directory contains ready-to-use starter files for each profile. Rather than copying files manually, use the `setup-org-templates.sh` script to push all four templates as proper GitHub template repositories in one command.
+
+### Quick setup for a new organisation
+
+```bash
+# 1. Authenticate
+gh auth login
+
+# 2. Push shared-workflows itself to the org (required before templates)
+gh repo create <org>/shared-workflows --private --source=. --remote=origin --push
+
+# 3. Grant org-wide workflow access
+gh api --method PUT /repos/<org>/shared-workflows/actions/permissions/access \
+  --field access_level=organization
+
+# 4. Create and push all four template repos
+./setup-org-templates.sh <org>
+```
+
+### setup-org-templates.sh
+
+```
+Usage: ./setup-org-templates.sh [OPTIONS] <org-name>
+
+Options:
+  -t, --templates-dir <path>   Override the templates directory (default: ./templates)
+  -d, --delete                 Delete the four template repos from the org (remote only)
+  -y, --yes                    Skip confirmation prompt in delete mode
+  -h, --help                   Full usage documentation
+
+Examples:
+  ./setup-org-templates.sh my-org
+  ./setup-org-templates.sh --delete --yes my-org
+  ./setup-org-templates.sh -t /opt/templates my-org
+```
+
+**What the script does for each profile:**
+1. Copies the template folder into a `mktemp` working directory (originals untouched)
+2. Replaces `<YOUR-ORG>` with the supplied org name in all files
+3. Initialises a `git` repo on `main` and makes an initial commit
+4. Calls `gh repo create <org>/<repo> --private --source=. --push`
+5. Calls `gh api PATCH /repos/<org>/<repo>` with `is_template=true`
+
+**Prerequisites:**
+- `git`, `gh` CLI, `sed`, `grep` on `PATH`
+- `gh auth login` completed with `repo` and `delete_repo` scopes
+  ```bash
+  gh auth refresh -h github.com -s delete_repo   # add delete scope if needed
+  ```
 
 ### Template layout
 

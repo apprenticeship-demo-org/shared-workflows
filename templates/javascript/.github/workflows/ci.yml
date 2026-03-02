@@ -24,8 +24,11 @@ on:
 
 # Permissions required by the shared-workflows pipeline chain.
 # security-events: write is needed for Trivy SARIF upload to the Security tab.
+# pull-requests: write is needed for Copilot reviewer assignment.
+# contents: write is needed for the Copilot instructions commit.
 permissions:
-  contents: read
+  contents: write
+  pull-requests: write
   security-events: write
 
 jobs:
