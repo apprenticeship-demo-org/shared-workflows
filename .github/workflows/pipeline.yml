@@ -75,7 +75,7 @@ jobs:
   cache-warmer:
     name: Warm cache (${{ needs.read-profile.outputs.profile }})
     needs: [read-profile]
-    uses: ./.github/workflows/shared/cache-warmer.yml
+    uses: ./.github/workflows/cache-warmer.yml
     with:
       profile:           ${{ needs.read-profile.outputs.profile }}
       java-version:      ${{ inputs.java-version }}
@@ -89,7 +89,7 @@ jobs:
     name: Java profile
     needs: [read-profile, cache-warmer]
     if: needs.read-profile.outputs.profile == 'java'
-    uses: ./.github/workflows/profiles/java.yml
+    uses: ./.github/workflows/java.yml
     with:
       java-version: ${{ inputs.java-version }}
     secrets: inherit
@@ -98,7 +98,7 @@ jobs:
     name: Python profile
     needs: [read-profile, cache-warmer]
     if: needs.read-profile.outputs.profile == 'python'
-    uses: ./.github/workflows/profiles/python.yml
+    uses: ./.github/workflows/python.yml
     with:
       python-version: ${{ inputs.python-version }}
     secrets: inherit
@@ -107,7 +107,7 @@ jobs:
     name: JavaScript profile
     needs: [read-profile, cache-warmer]
     if: needs.read-profile.outputs.profile == 'javascript'
-    uses: ./.github/workflows/profiles/javascript.yml
+    uses: ./.github/workflows/javascript.yml
     with:
       node-version: ${{ inputs.node-version }}
     secrets: inherit
@@ -116,7 +116,7 @@ jobs:
     name: DevOps profile
     needs: [read-profile, cache-warmer]
     if: needs.read-profile.outputs.profile == 'devops'
-    uses: ./.github/workflows/profiles/devops.yml
+    uses: ./.github/workflows/devops.yml
     with:
       dockerfile-path:    ${{ inputs.dockerfile-path }}
       terraform-version:  ${{ inputs.terraform-version }}
@@ -131,7 +131,7 @@ jobs:
     name: Trivy SARIF → Security tab
     needs: [read-profile, java, python, javascript, devops]
     if: always() && !failure() && !cancelled()
-    uses: ./.github/workflows/shared/trivy.yml
+    uses: ./.github/workflows/trivy.yml
     with:
       profile: ${{ needs.read-profile.outputs.profile }}
     secrets: inherit
@@ -140,7 +140,7 @@ jobs:
     name: SonarQube analysis
     needs: [read-profile, java, python, javascript, devops]
     if: always() && !failure() && !cancelled()
-    uses: ./.github/workflows/shared/sonarqube.yml
+    uses: ./.github/workflows/sonarqube.yml
     with:
       project-key: ${{ inputs.sonar-project-key }}
     secrets: inherit
@@ -149,5 +149,5 @@ jobs:
     name: Copilot PR review
     needs: [read-profile, java, python, javascript, devops]
     if: always() && !failure() && !cancelled() && github.event_name == 'pull_request'
-    uses: ./.github/workflows/shared/copilot-review.yml
+    uses: ./.github/workflows/copilot-review.yml
     secrets: inherit
