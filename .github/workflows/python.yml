@@ -183,14 +183,7 @@ jobs:
           # A ::warning annotation flags coverage below 80 % but does NOT fail
           # the pipeline — SonarQube is the quality gate for coverage.
           if [[ -f coverage.xml ]]; then
-            COVERAGE=$(python3 -c "
-import xml.etree.ElementTree as ET
-try:
-    rate = float(ET.parse('coverage.xml').getroot().attrib.get('line-rate', 0)) * 100
-    print(f'{rate:.1f}')
-except Exception:
-    print('unknown')
-" 2>/dev/null || echo unknown)
+            COVERAGE=$(python3 -c "import xml.etree.ElementTree as ET; rate=float(ET.parse('coverage.xml').getroot().attrib.get('line-rate',0))*100; print(f'{rate:.1f}')" 2>/dev/null || echo unknown)
             if [[ "$COVERAGE" != "unknown" ]]; then
               PCT=${COVERAGE%.*}
               if (( PCT >= 80 )); then ICON="🟢"; FLAG="✅ Pass"; else ICON="🟡"; FLAG="⚠️ Below threshold — SonarQube quality gate may fail"; fi
