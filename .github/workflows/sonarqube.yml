@@ -61,7 +61,7 @@ on:
         type: string
         default: ""
       profile:
-        description: "CI profile that ran: java | python | javascript. Devops is excluded from SonarQube."
+        description: "CI profile that ran: java | python | javascript | devops."
         required: false
         type: string
         default: ""
@@ -169,6 +169,21 @@ jobs:
             javascript)
               EXTRA="-Dsonar.javascript.lcov.reportPaths=coverage/lcov.info,coverage/lcov-report/lcov.info"
               EXTRA="$EXTRA -Dsonar.typescript.tsconfigPaths=tsconfig.json"
+              ;;
+            devops)
+              # SonarQube natively analyses all IaC languages in a DevOps repo:
+              #   Terraform (.tf)       — security misconfigs, best practices (AWS/Azure/GCP)
+              #   Docker (Dockerfile*)  — instruction-level security and quality rules
+              #   Kubernetes/Helm       — manifest security and compliance rules
+              #   GitHub Actions (.yml) — workflow security rules
+              #   Shell (.sh)           — shellcheck-equivalent static analysis
+              #   Python (.py)          — style, bugs, security (if utility scripts present)
+              #   Groovy/Jenkinsfile    — pipeline syntax and quality rules
+              #
+              # Only exclude non-source artefacts that SonarQube cannot analyse
+              # and would waste scan time on: provider plugin cache, vendored
+              # dependencies, lock files, and package manager download caches.
+              EXTRA="-Dsonar.exclusions=**/.terraform/**,**/vendor/**,**/node_modules/**,**/*.lock"
               ;;
             *)
               # Empty profile or unknown — generic scan with no coverage args
