@@ -17,6 +17,13 @@
 # consistently across branches and PRs so history accumulates in one place.
 # Override via the project-key input if the repo needs a custom key.
 #
+# ── vars.SONAR_HOST_URL vs secrets.SONAR_HOST_URL ─────────────────────────────
+# SONAR_HOST_URL is provisioned by post-apply.sh as a GitHub org *variable*
+# (gh variable set SONAR_HOST_URL …), not a secret. It must be referenced as
+# vars.SONAR_HOST_URL. Using secrets.SONAR_HOST_URL silently resolves to an
+# empty string at runtime and causes the scanner to fall back to
+# https://sonarcloud.io instead of the self-hosted instance.
+#
 # ── Artifact pattern '*-build' ────────────────────────────────────────────────
 # Each profile uploads artifacts under a profile-specific name:
 #   java-build       → target/ + target/site/jacoco/jacoco.xml
@@ -53,12 +60,17 @@ on:
         required: false
         type: string
         default: ""
+      profile:
+        description: "CI profile that ran: java | python | javascript. Devops is excluded from SonarQube."
+        required: false
+        type: string
+        default: ""
     secrets:
       SONAR_TOKEN:
         required: false
-      SONAR_HOST_URL:
-        description: "Alternative way to supply the SonarQube host URL as a secret."
-        required: false
+      # NOTE: SONAR_HOST_URL is NOT a secret — it is a GitHub org variable
+      # provisioned via `gh variable set`. Reference it as vars.SONAR_HOST_URL.
+      # This secret declaration is intentionally absent.
 
 jobs:
   sonarqube:
@@ -110,26 +122,82 @@ jobs:
             echo "Derived project key: $KEY"
           fi
           echo "key=$KEY" >> "$GITHUB_OUTPUT"
+          # Also export to env so the pre-register step and scanner-args step
+          # can reference it directly without steps.<id>.outputs.* syntax.
+          echo "PROJECT_KEY=$KEY" >> "$GITHUB_ENV"
 
-      # ── 4. SonarQube scan ─────────────────────────────────────────────────
+      # ── 4. Pre-register project in SonarQube ──────────────────────────────
+      # Calls the SonarQube projects/create API before the scanner runs.
+      # This ensures the project exists under the correct key and name on the
+      # very first push — without it the scanner would create the project but
+      # with default settings that may not match the permission template.
+      # || true makes this step idempotent: a 400 "already exists" response is
+      # silently absorbed so subsequent pushes continue without error.
+      # Requires SONAR_TOKEN (org secret) and SONAR_HOST_URL (org variable).
+      - name: Pre-register project in SonarQube
+        env:
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL || inputs.sonar-host-url }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          curl -sf -o /dev/null \
+            -X POST "$SONAR_HOST_URL/api/projects/create" \
+            -H "Authorization: Bearer $SONAR_TOKEN" \
+            -d "project=$PROJECT_KEY&name=$PROJECT_KEY" || true
+          echo "Pre-registration attempted for project: $PROJECT_KEY"
+
+      # ── 5. Build language-specific scanner arguments ───────────────────────
+      # Constructs extra -D properties based on the profile that ran upstream.
+      # Each language needs different coverage report paths and binary dirs.
+      # The scanner silently ignores -D paths that do not exist so it is safe
+      # to include both Maven and Gradle output paths for Java — whichever
+      # build tool the caller uses, the correct report will be picked up.
+      # Profile 'devops' never reaches this workflow (blocked in pipeline.yml)
+      # so only java / python / javascript cases are handled here.
+      - name: Build scanner args
+        id: scanner-args
+        run: |
+          EXTRA=""
+          case "${{ inputs.profile }}" in
+            java)
+              EXTRA="-Dsonar.java.binaries=target/classes,build/classes/java/main"
+              EXTRA="$EXTRA -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml,build/reports/jacoco/test/jacocoTestReport.xml"
+              ;;
+            python)
+              EXTRA="-Dsonar.python.coverage.reportPaths=coverage.xml"
+              EXTRA="$EXTRA -Dsonar.python.version=3"
+              ;;
+            javascript)
+              EXTRA="-Dsonar.javascript.lcov.reportPaths=coverage/lcov.info,coverage/lcov-report/lcov.info"
+              EXTRA="$EXTRA -Dsonar.typescript.tsconfigPaths=tsconfig.json"
+              ;;
+            *)
+              # Empty profile or unknown — generic scan with no coverage args
+              echo "No profile-specific scanner args (profile='${{ inputs.profile }}')"
+              ;;
+          esac
+          echo "extra=$EXTRA" >> "$GITHUB_OUTPUT"
+          echo "Scanner extra args: $EXTRA"
+
+      # ── 6. SonarQube scan ─────────────────────────────────────────────────
       # Submits source and analysis metadata to the SonarQube server.
       # The scan runs asynchronously on the server — this step returns as soon
       # as the task is queued. The quality gate step (below) polls for the
       # result. SONAR_HOST_URL is read from the secret if set, otherwise falls
       # back to the input so both configuration styles work.
       - name: SonarQube scan
-        uses: SonarSource/sonarqube-scan-action@master
+        uses: SonarSource/sonarqube-scan-action@v3
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL || inputs.sonar-host-url }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL || inputs.sonar-host-url }}
         with:
           args: >
             -Dsonar.projectKey=${{ steps.sonar-key.outputs.key }}
             -Dsonar.projectName=${{ github.event.repository.name }}
             -Dsonar.sources=.
             -Dsonar.scm.provider=git
+            ${{ steps.scanner-args.outputs.extra }}
 
-      # ── 5. Quality gate check ──────────────────────────────────────────────
+      # ── 7. Quality gate check ──────────────────────────────────────────────
       # Polls the SonarQube server until the background analysis task that was
       # submitted in step 4 finishes and the quality gate result is published.
       # Fails this step (and therefore the pipeline) if the gate is RED.
@@ -140,13 +208,13 @@ jobs:
       - name: SonarQube quality gate check
         id: quality-gate
         if: always()
-        uses: SonarSource/sonarqube-quality-gate-action@master
+        uses: SonarSource/sonarqube-quality-gate-action@v1
         timeout-minutes: 5
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL || inputs.sonar-host-url }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL || inputs.sonar-host-url }}
 
-      # ── 6. Quality gate summary ────────────────────────────────────────────
+      # ── 8. Quality gate summary ────────────────────────────────────────────
       # Prints the gate status to the log so it is visible without navigating
       # to the SonarQube UI. A RED gate will have already failed step 5;
       # this step is informational only. if: always() runs it on success and
@@ -159,6 +227,6 @@ jobs:
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo "  Project key  : ${{ steps.sonar-key.outputs.key }}"
           echo "  Project name : ${{ github.event.repository.name }}"
-          echo "  SonarQube    : ${{ secrets.SONAR_HOST_URL || inputs.sonar-host-url }}"
+          echo "  SonarQube    : ${{ vars.SONAR_HOST_URL || inputs.sonar-host-url }}"
           echo "  Quality gate : ${{ steps.quality-gate.outputs.quality-gate-status }}"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

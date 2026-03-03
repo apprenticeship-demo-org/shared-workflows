@@ -25,7 +25,11 @@
 # 15.  Helm lint                – validates chart structure and values
 # 16.  detect Jenkinsfile       – sets has_jenkinsfile output; gates step 17
 # 17.  Jenkinsfile validate     – syntax check via declarative-linter
-# 18.  upload artifacts         – always runs; preserves all IaC files for audit
+# 18.  detect shell scripts     – sets has_shell output; gates step 19
+# 19.  shellcheck               – lints all .sh files for errors and best practices
+# 20.  detect Python scripts    – sets has_python output; gates step 21
+# 21.  flake8                   – lints all .py utility scripts (120-char line limit)
+# 22.  upload artifacts         – always runs; preserves all IaC files for audit
 
 name: DevOps CI
 
@@ -64,7 +68,7 @@ env:
 
 jobs:
   validate:
-    name: YAML → Docker → Terraform → Helm → Jenkinsfile → Upload
+    name: YAML → Docker → Terraform → Helm → Jenkinsfile → Shell → Python → Upload
     runs-on: ubuntu-latest
 
     steps:
@@ -350,11 +354,69 @@ jobs:
           # Scripted pipelines produce a 200 response with a parse notice
           # rather than failing, which is the correct behaviour in CI.
 
-      # ── 18. Upload artifacts ───────────────────────────────────────────────
-      # Persists all IaC, Dockerfile, YAML, and Jenkinsfile paths for audit
-      # and downstream SonarQube analysis. if: always() ensures the upload
-      # runs even when a lint step has failed so reviewers can inspect exactly
-      # which files triggered the failure.
+      # ── 18. Detect shell scripts ───────────────────────────────────────────
+      # Checks whether the repository contains any .sh files before running
+      # shellcheck. step 19 depends on this output being 'true'. If the repo
+      # has no shell scripts the step is skipped gracefully — DevOps labs
+      # may not write any shell automation at all.
+      - name: Detect shell scripts
+        id: detect-shell
+        run: |
+          if find . -name "*.sh" -not -path "./.git/*" | grep -q .; then
+            echo "has_shell=true"  >> "$GITHUB_OUTPUT"
+            echo "Shell scripts detected"
+          else
+            echo "has_shell=false" >> "$GITHUB_OUTPUT"
+            echo "No .sh files found — ShellCheck step will be skipped"
+          fi
+
+      # ── 19. ShellCheck ─────────────────────────────────────────────────────
+      # Lints all .sh files for common errors (unquoted variables, missing
+      # set -e, word splitting, etc.). shellcheck is installed from apt at
+      # runtime — it is a binary with no Python/npm deps so no dedicated
+      # cache is needed; apt install takes ~3 seconds.
+      #
+      # xargs -0 handles filenames with spaces. The default severity blocks
+      # on errors (SC2xxx); informational findings are printed but do not
+      # fail the job.
+      - name: Lint — Shell scripts (shellcheck)
+        if: steps.detect-shell.outputs.has_shell == 'true'
+        run: |
+          sudo apt-get install -y shellcheck -qq
+          find . -name "*.sh" -not -path "./.git/*" -print0 \
+            | xargs -0 shellcheck --severity=error
+
+      # ── 20. Detect Python scripts ──────────────────────────────────────────
+      # Checks whether the repository contains any .py files before running
+      # flake8. Step 21 depends on this output being 'true'. If the repo
+      # has no Python scripts the step is skipped gracefully.
+      - name: Detect Python scripts
+        id: detect-python
+        run: |
+          if find . -name "*.py" -not -path "./.git/*" -not -path "./.venv/*" | grep -q .; then
+            echo "has_python=true"  >> "$GITHUB_OUTPUT"
+            echo "Python scripts detected"
+          else
+            echo "has_python=false" >> "$GITHUB_OUTPUT"
+            echo "No .py files found — flake8 step will be skipped"
+          fi
+
+      # ── 21. flake8 ─────────────────────────────────────────────────────────
+      # Lints all .py files for style and syntax errors. Uses the same
+      # 120-char line limit as the Python profile (python.yml) to keep rules
+      # consistent across all profiles. flake8 is available in the runner's
+      # pip cache because it is pre-installed in the devops pip warm-up step
+      # in cache-warmer.yml alongside yamllint.
+      - name: Lint — Python scripts (flake8)
+        if: steps.detect-python.outputs.has_python == 'true'
+        run: |
+          pip install --quiet flake8
+          flake8 . --max-line-length=120 --exclude=.venv,venv,env,.env
+
+      # ── 22. Upload artifacts ───────────────────────────────────────────────
+      # Persists all IaC, Dockerfile, YAML, and Jenkinsfile paths for audit.
+      # if: always() ensures the upload runs even when a lint step has failed
+      # so reviewers can inspect exactly which files triggered the failure.
       #
       # if-no-files-found: warn rather than error because not every DevOps lab
       # will contain all file types — a Terraform-only repo has no Dockerfile,

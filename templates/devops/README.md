@@ -24,7 +24,9 @@ When you push or open a pull request the pipeline will:
 4. Lint Helm charts with `helm lint` (if a `Chart.yaml` is present).
 5. Run `terraform validate` (if `.tf` files are present).
 6. Detect a `Jenkinsfile` and note it for review.
-7. Scan for secrets and vulnerabilities across all files.
+7. Lint all `.sh` files with ShellCheck (if any shell scripts are present).
+8. Lint all `.py` utility scripts with flake8 (if any Python files are present).
+9. Scan for secrets and vulnerabilities across all files.
 
 You don't need to configure any of this — it runs based on what files exist in your repo.
 

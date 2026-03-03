@@ -127,7 +127,7 @@ This regex extracts the bare value after `profile: ` without any shell variable 
     ├── java.yml              ← Java CI: lint → build → test → scan → upload
     ├── python.yml            ← Python CI: lint → install → test → scan → upload
     ├── javascript.yml        ← JS/TS CI: detect → install → lint → build → test → scan → upload
-    ├── devops.yml            ← DevOps CI: YAML → Dockerfile → Terraform → Helm → Jenkinsfile
+    ├── devops.yml            ← DevOps CI: YAML → Dockerfile → Terraform → Helm → Jenkinsfile → Shell → Python
     ├── cache-warmer.yml      ← Pre-populate caches before the profile job runs
     ├── trivy.yml             ← SARIF upload to Security tab + Dockerfile CVE scanning
     ├── sonarqube.yml         ← SonarQube/SonarCloud analysis + quality gate
@@ -352,8 +352,8 @@ Setting this at job level means every `terraform` command automatically reads fr
 | # | Step | Conditional | Why it runs here |
 |---|------|-------------|-----------------|
 | 1 | **Checkout** | — | Source first |
-| 2 | **Restore pip cache** | — | yamllint is Python; cache before install |
-| 3 | **Install yamllint** | — | Broadest linter; runs first to catch YAML syntax before tool-specific validators |
+| 2 | **Restore pip cache** | — | yamllint and flake8 are Python-based; cache before install |
+| 3 | **Install yamllint + flake8** | — | yamllint: broadest linter; flake8: available for step 21 |
 | 4 | **YAML lint** | — | Uses `.yamllint.yml` if present; otherwise defaults |
 | 5 | **hadolint** | — | Recursive Dockerfile linter; `failure-threshold: warning` blocks on warnings+ |
 | 6 | **Detect Terraform** | — | Sets `has_terraform` output by checking for `*.tf` files |
@@ -369,7 +369,26 @@ Setting this at job level means every `terraform` command automatically reads fr
 | 16 | **`helm lint`** | `has_helm` | Validates chart structure and templating |
 | 17 | **Detect Jenkinsfile** | — | Sets `has_jenkinsfile` by checking for `Jenkinsfile` |
 | 18 | **Jenkinsfile validate** | `has_jenkinsfile` | Declarative-linter via Docker; validates pipeline DSL syntax |
-| 19 | **Upload `devops-build`** | `always()` | Persists all IaC files for audit download |
+| 19 | **Detect shell scripts** | — | Sets `has_shell` output by checking for `*.sh` files |
+| 20 | **shellcheck** | `has_shell` | Lints all `.sh` files; `--severity=error` blocks on errors, warnings are informational |
+| 21 | **Detect Python scripts** | — | Sets `has_python` output by checking for `*.py` files |
+| 22 | **flake8** | `has_python` | Lints all `.py` files; 120-char line limit, same config as `python.yml` |
+| 23 | **Upload `devops-build`** | `always()` | Persists all IaC files for audit download |
+
+### Shell script linting (ShellCheck)
+
+ShellCheck is installed from `apt` at runtime rather than from a dedicated cache. It is a compiled binary (~2 MB) with no Python or Node dependencies; `apt-get install shellcheck` completes in ~3 seconds and does not justify a separate cache entry.
+
+All `.sh` files are discovered recursively with `find . -name "*.sh" -not -path "./.git/*"` and fed to shellcheck via `xargs -0` to handle filenames with spaces. The `--severity=error` flag means:
+
+- **Error** (SC2xxx unquoted variables, missing `set -e` in critical paths, etc.) → fails the job
+- **Warning / info / style** → printed to the log, job continues
+
+### Python script linting (flake8)
+
+flake8 is installed alongside `yamllint` in the pip warm-up step (step 3) so it is always available from cache. The `--max-line-length=120 --exclude=.venv,venv,env,.env` flags are identical to the `python.yml` profile to keep style rules consistent across all profiles — apprentices moving between profiles should not encounter different linting standards for the same Python code.
+
+This step catches `.py` utility scripts common in DevOps repos: Ansible module helpers, custom Terraform external data source scripts, deployment automation, seed scripts, etc.
 
 ### Why `terraform init -backend=false`?
 
@@ -512,7 +531,7 @@ These are declared on the `trivy-sarif` job rather than at workflow level so cal
 
 ## 13. `sonarqube.yml`
 
-**Role:** SonarQube / SonarCloud code quality analysis with quality gate polling.
+**Role:** SonarQube / SonarCloud code quality analysis with quality gate polling. Skipped entirely for the `devops` profile — IaC files have no coverage metrics and SonarQube's bug/code-smell rules are not applicable to `.tf`, `.yml`, or `Dockerfile` content.
 
 ### Why `fetch-depth: 0`
 
@@ -536,9 +555,38 @@ Without `fetch-depth: 0`, every finding appears as "new" and blame metrics are w
 PROJECT_KEY="${{ github.repository_owner }}_${{ github.event.repository.name }}"
 ```
 
-This means every lab repo **self-registers** in SonarQube on its first run — no manual project creation required. The underscore separator is the SonarQube convention for org-scoped keys. The same key is used consistently across branches and PRs so history accumulates in one place.
+The underscore separator is the SonarQube convention for org-scoped keys. The same key is used consistently across branches and PRs so history accumulates in one place.
 
 Override with `project-key` input if the repo needs a custom key (e.g. for an existing project).
+
+### Automatic project registration
+
+Before the scanner runs, a `curl` call to the SonarQube Projects API pre-creates the project:
+
+```bash
+curl -sf -o /dev/null \
+  -X POST "$SONAR_HOST_URL/api/projects/create" \
+  -H "Authorization: Bearer $SONAR_TOKEN" \
+  -d "project=$PROJECT_KEY&name=$PROJECT_KEY" || true
+```
+
+This ensures the project exists in SonarQube (with its permission template applied) before the scanner uploads any analysis data. The `|| true` makes the call **idempotent** — a `400 Already Exists` response from the server is silently swallowed on every subsequent push. No manual project creation in the SonarQube UI is ever required.
+
+**Prerequisites:** `SONAR_TOKEN` must be an org-level **Global Analysis Token** (not a project-scoped token). `SONAR_HOST_URL` must be set as an org variable pointing to the self-hosted SonarQube server. Both are forwarded automatically via `secrets: inherit`.
+
+### Profile-aware scanner arguments
+
+The workflow receives the `profile` input from `pipeline.yml` and builds language-specific `-D` properties before the scanner runs:
+
+| Profile | Extra scanner properties |
+|---------|-------------------------|
+| `java` | `sonar.java.binaries=target/classes,build/classes/java/main` (covers both Maven and Gradle output dirs) · `sonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml,build/reports/jacoco/test/jacocoTestReport.xml` |
+| `python` | `sonar.python.coverage.reportPaths=coverage.xml` · `sonar.python.version=3` |
+| `javascript` | `sonar.javascript.lcov.reportPaths=coverage/lcov.info,coverage/lcov-report/lcov.info` · `sonar.typescript.tsconfigPaths=tsconfig.json` |
+| `""` (unknown) | No extra args — generic scan only |
+| `devops` | Never reaches this workflow (blocked in `pipeline.yml`) |
+
+Paths that do not exist in the repo are silently ignored by the scanner — listing both Maven and Gradle JaCoCo paths for Java is safe regardless of which build tool the caller uses.
 
 ### Artifact download pattern
 
@@ -557,7 +605,7 @@ The wildcard `*-build` matches whichever artifact was produced by the profile jo
 | java | `java-build` | `target/` + `target/site/jacoco/jacoco.xml` |
 | python | `python-build` | `coverage.xml` |
 | javascript | `js-build` | `dist/` / `build/` / `.next/` + `coverage/` |
-| devops | `devops-build` | `.tf`, `Dockerfile`, `.yml`, `Jenkinsfile` |
+| devops | — | Skipped — `pipeline.yml` does not call `sonarqube.yml` for this profile |
 
 `merge-multiple: true` flattens all matched artifacts into the working directory. `continue-on-error: true` ensures the SonarQube job does not fail if the profile job did not produce an artifact (e.g. on a compile failure).
 
@@ -572,14 +620,16 @@ The wildcard `*-build` matches whichever artifact was produced by the profile jo
 
 `sonarqube-scan-action` submits the analysis and returns immediately — the analysis runs asynchronously on the SonarQube server. `sonarqube-quality-gate-action` polls until the background task completes and the gate is evaluated, then fails the step if the gate is **RED**. `timeout-minutes: 5` prevents the job hanging indefinitely if the server is slow or offline. `if: always()` ensures the gate check runs even if the scan submission step failed.
 
-### Dual SONAR_HOST_URL support
+### `vars.SONAR_HOST_URL` vs `secrets.SONAR_HOST_URL`
 
 ```yaml
 env:
-  SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL || inputs.sonar-host-url }}
+  SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL || inputs.sonar-host-url }}
 ```
 
-The host URL can be supplied either as an org-level secret (preferred for self-hosted SonarQube) or as a workflow input (useful when calling the workflow directly). The secret takes precedence.
+`SONAR_HOST_URL` is provisioned as a GitHub org **variable** (not a secret) via `gh variable set`. It must be referenced as `vars.SONAR_HOST_URL`. Using `secrets.SONAR_HOST_URL` silently resolves to an empty string at runtime, causing the scanner to fall back to `inputs.sonar-host-url` which defaults to `https://sonarcloud.io` — entirely the wrong target for a self-hosted instance.
+
+The fallback to `inputs.sonar-host-url` is retained so the workflow still works when called directly with an explicit URL override.
 
 ---
 
@@ -743,6 +793,7 @@ Layer 1 and Layer 2 scan the **same files** (the repo source tree) but produce d
 |-------|----------|---------|-------------|
 | `sonar-host-url` | no | `https://sonarcloud.io` | SonarQube server URL |
 | `project-key` | no | `""` | Override SonarQube project key |
+| `profile` | no | `""` | Profile that ran (`java\|python\|javascript`); controls language-specific scanner args and coverage paths. `devops` never calls this workflow. |
 
 ### `shared/cache-warmer.yml`
 
@@ -763,26 +814,35 @@ Layer 1 and Layer 2 scan the **same files** (the repo source tree) but produce d
 
 ---
 
-## 18. Secrets reference
+## 18. Secrets and variables reference
+
+### Secrets
 
 | Secret | Required by | Where to set | Description |
 |--------|-------------|--------------|-------------|
-| `SONAR_TOKEN` | `sonarqube.yml` | Org or repo secret | SonarQube / SonarCloud API token. Generate from _SonarCloud → My Account → Security → Generate Token_. |
-| `SONAR_HOST_URL` | `sonarqube.yml` | Org or repo secret | Only required for **self-hosted** SonarQube. Omit for SonarCloud (defaults to `https://sonarcloud.io`). |
+| `SONAR_TOKEN` | `sonarqube.yml` | Org secret | SonarQube Global Analysis token. Set by `post-apply.sh` via `gh secret set SONAR_TOKEN`. |
 | `GITHUB_TOKEN` | `trivy.yml`, `copilot-review.yml` | Auto-provided | Automatically injected by GitHub Actions — no setup required. Must not be restricted to read-only (see Section 19). |
 
-### How to set up secrets
+### Variables
 
-1. Go to **Settings → Secrets and variables → Actions** in the organisation (recommended) or in each lab repository.
-2. Click **New organization secret** → set **Repository access** to _All repositories_ (or specific repos).
-3. Add the following:
+| Variable | Required by | Where to set | Description |
+|----------|-------------|--------------|-------------|
+| `SONAR_HOST_URL` | `sonarqube.yml` | Org variable | Full base URL of the self-hosted SonarQube instance (e.g. `http://1.2.3.4:9000`). Set by `post-apply.sh` via `gh variable set SONAR_HOST_URL`. Referenced as `vars.SONAR_HOST_URL`, **not** `secrets.SONAR_HOST_URL`. |
 
-```
-SORAR_TOKEN      = <token from SonarCloud → My Account → Security>
-SORAR_HOST_URL   = https://sonarcloud.io   # or your self-hosted URL
-```
+### How to set up
 
-Because `pipeline.yml` uses `secrets: inherit`, all secrets available in the calling repository are automatically forwarded to every called workflow — you do not need to enumerate them explicitly.
+1. Go to **Settings → Secrets and variables → Actions** in the organisation.
+2. Under **Secrets**, click **New organization secret**:
+   ```
+   SONAR_TOKEN = <Global Analysis token from SonarQube Administration → Security → Users>
+   ```
+3. Under **Variables**, click **New organization variable**:
+   ```
+   SONAR_HOST_URL = http://<ec2-public-ip>:9000
+   ```
+   > `SONAR_HOST_URL` is a variable, not a secret — it is not sensitive and must not be stored under Secrets or it will resolve to an empty string at runtime.
+
+Because `pipeline.yml` uses `secrets: inherit`, `SONAR_TOKEN` is forwarded automatically. `SONAR_HOST_URL` as an org variable is available to all workflows in the org as `vars.SONAR_HOST_URL` without any explicit forwarding.
 
 ### Environment variables (internal — no setup required)
 

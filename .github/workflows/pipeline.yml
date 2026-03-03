@@ -147,10 +147,11 @@ jobs:
   sonarqube:
     name: SonarQube analysis
     needs: [read-profile, java, python, javascript, devops]
-    if: always() && !failure() && !cancelled()
+    if: always() && !failure() && !cancelled() && needs.read-profile.outputs.profile != 'devops'
     uses: ./.github/workflows/sonarqube.yml
     with:
       project-key: ${{ inputs.sonar-project-key }}
+      profile: ${{ needs.read-profile.outputs.profile }}
     secrets: inherit
 
   copilot-review:

@@ -390,9 +390,9 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-devops-pip
 
-      - name: DevOps — install yamllint
+      - name: DevOps — install yamllint and flake8
         if: inputs.profile == 'devops'
-        run: pip install --quiet yamllint
+        run: pip install --quiet yamllint flake8
 
       # Detect which DevOps tooling the repo uses before touching the heavier
       # caches. This mirrors the detection gates in devops.yml and avoids
