@@ -4,23 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - '.vscode/**'
-      - '.github/ISSUE_TEMPLATE/**'
-      - '.github/PULL_REQUEST_TEMPLATE.md'
-      - '.trivyignore'
-      - '.gitignore'
   pull_request:
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - '.vscode/**'
-      - '.github/ISSUE_TEMPLATE/**'
-      - '.github/PULL_REQUEST_TEMPLATE.md'
-      - '.trivyignore'
-      - '.gitignore'
 
 # Permissions required by the shared-workflows pipeline chain.
 # security-events: write is needed for Trivy SARIF upload to the Security tab.
@@ -32,7 +16,44 @@ permissions:
   security-events: write
 
 jobs:
+
+  # ── Detect whether any non-doc files changed ──────────────────────────────
+  # Always runs so branch protection status checks are always satisfied —
+  # even when only docs changed and the pipeline is skipped.
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.filter.outputs.src }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            src:
+              - '!**.md'
+              - '!docs/**'
+              - '!.vscode/**'
+              - '!.github/ISSUE_TEMPLATE/**'
+              - '!.github/PULL_REQUEST_TEMPLATE.md'
+              - '!.trivyignore'
+              - '!.gitignore'
+
+  # ── Skip notice (docs-only change) ────────────────────────────────────────
+  skip:
+    name: CI skipped (docs only)
+    needs: changes
+    if: needs.changes.outputs.run == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Only documentation files changed — full CI pipeline skipped."
+
+  # ── Full pipeline ──────────────────────────────────────────────────────────
   pipeline:
+    name: CI pipeline
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
     # ── Replace <YOUR-ORG> with your GitHub organisation name ──────────────
     uses: <YOUR-ORG>/shared-workflows/.github/workflows/pipeline.yml@main
     secrets: inherit
@@ -41,3 +62,26 @@ jobs:
     #   terraform-version: "latest"   # default: latest
     #   dockerfile-path: "Dockerfile" # default: Dockerfile
     #   sonar-project-key: ""         # default: auto-derived as {org}_{repo}
+
+  # ── Aggregated status ─────────────────────────────────────────────────────
+  # THIS is the only check to add to branch protection rules: "CI Status"
+  # Always runs. Passes when pipeline succeeded or was skipped (docs-only).
+  # Fails when the pipeline actually failed.
+  ci-status:
+    name: CI Status
+    runs-on: ubuntu-latest
+    needs: [pipeline, skip]
+    if: always()
+    steps:
+      - name: Evaluate result
+        run: |
+          PIPELINE="${{ needs.pipeline.result }}"
+          SKIP="${{ needs.skip.result }}"
+          if [[ "$PIPELINE" == "success" || "$PIPELINE" == "skipped" ]] && \
+             [[ "$SKIP"     == "success" || "$SKIP"     == "skipped" ]]; then
+            echo "CI Status: passed (pipeline=$PIPELINE, skip=$SKIP)"
+            exit 0
+          else
+            echo "CI Status: failed (pipeline=$PIPELINE, skip=$SKIP)"
+            exit 1
+          fi
