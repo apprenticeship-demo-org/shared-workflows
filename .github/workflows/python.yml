@@ -3,21 +3,30 @@
 #
 # Step order rationale
 # ─────────────────────────────────────────────────────────────────────────────
-# 1. checkout            – source must be present before anything else runs
-# 2. setup-python        – toolchain + built-in pip cache (layer 1 caching)
-# 3. restore-pip-cache   – explicit ~/.cache/pip cache with two-level key
-#                          strategy (layer 2 caching for fine-grained control)
-# 4. restore-venv-cache  – caches .venv if the project uses one; avoids
-#                          recreating the virtual environment on every run
-# 5. pre-warm cache      – installs common packages (pytest, flake8, requests…)
-#                          so most lab repos hit the cache on first run
-# 6. lint (flake8)       – fast static gate; fail early before install + tests
-# 7. install deps        – requirements.txt installed after lint passes
-# 8. trivy scan          – CVE check on installed packages before running tests
-#                          so apprentices get security feedback without waiting
-#                          for the full test suite to complete
-# 9. test (pytest)       – run tests + generate coverage report
-# 10. upload-artifact    – persist coverage.xml for downstream SonarQube job
+# 1.  checkout            – source must be present before anything else runs
+# 2.  detect dep manifest – checks for requirements*.txt/pyproject.toml/Pipfile/
+#                           setup.cfg; gates setup-python cache and install step;
+#                           warns (not hard-fails) if Python code exists but no
+#                           manifest is found
+# 3.  setup-python        – toolchain; pip cache only enabled when a manifest
+#                           was detected (avoids "no file found" action error)
+# 4.  restore-pip-cache   – explicit ~/.cache/pip cache with two-level key
+#                           strategy (layer 2 caching for fine-grained control)
+# 5.  restore-venv-cache  – caches .venv if the project uses one; avoids
+#                           recreating the virtual environment on every run
+# 6.  pre-warm cache      – installs common packages (pytest, flake8, requests…)
+#                           so most lab repos hit the cache on first run
+# 7.  detect Python files – gates step 8; skip flake8 if no .py files present
+# 8.  lint (flake8)       – fast static gate; fail early before install + tests
+# 9.  detect Dockerfile   – gates step 10; skip hadolint if no Dockerfile present
+# 10. lint (hadolint)     – Dockerfile best-practice check
+# 11. install deps        – installs from whichever manifest is present;
+#                           skipped gracefully when no manifest found
+# 12. trivy scan          – CVE check on installed packages before running tests
+#                           so apprentices get security feedback without waiting
+#                           for the full test suite to complete
+# 13. test (pytest)       – run tests + generate coverage report
+# 14. upload-artifact     – persist coverage.xml for downstream SonarQube job
 
 name: Python CI
 
@@ -50,28 +59,68 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── 2. Set up Python (with built-in pip cache) ─────────────────────────
-      # Installs the requested Python version and enables setup-python's own
-      # pip cache as the first caching layer. This handles the most common case
-      # automatically and is the fastest path when the default cache key hits.
-      # The explicit cache steps below (layer 2) add finer-grained control.
+      # ── 2. Detect dependency manifest ───────────────────────────────────
+      # Checks for any recognised Python dependency manifest before anything
+      # that needs one runs. Recognised manifests (checked in priority order):
+      #   requirements*.txt  — most common in apprenticeship repos
+      #   pyproject.toml     — Poetry / Flit / PEP 517 projects
+      #   Pipfile            — Pipenv projects
+      #   setup.cfg          — classic setuptools projects
+      #   setup.py           — legacy setuptools projects
+      #
+      # has_deps=true  → setup-python pip cache enabled; install step runs
+      # has_deps=false → setup-python pip cache skipped (avoids action error);
+      #                   install step skipped; a ::warning is emitted later at
+      #                   the install step if .py files are present but no
+      #                   manifest was found, so the apprentice knows why deps
+      #                   were not installed.
+      - name: Detect dependency manifest
+        id: detect-deps
+        run: |
+          if find . -maxdepth 3 -not -path "./.git/*" \
+               \( -name "requirements*.txt" \
+               -o -name "pyproject.toml" \
+               -o -name "Pipfile" \
+               -o -name "setup.cfg" \
+               -o -name "setup.py" \) | grep -q .; then
+            # Capture which type was found first for use in the install step
+            if find . -maxdepth 3 -name "requirements*.txt" -not -path "./.git/*" | grep -q .; then
+              DEPS_TYPE=requirements
+            elif [[ -f pyproject.toml ]]; then
+              DEPS_TYPE=pyproject
+            elif [[ -f Pipfile ]]; then
+              DEPS_TYPE=pipfile
+            else
+              DEPS_TYPE=setuptools
+            fi
+            echo "has_deps=true"      >> "$GITHUB_OUTPUT"
+            echo "deps_type=$DEPS_TYPE" >> "$GITHUB_OUTPUT"
+            echo "Dependency manifest detected (type: $DEPS_TYPE)"
+          else
+            echo "has_deps=false"  >> "$GITHUB_OUTPUT"
+            echo "deps_type=none"  >> "$GITHUB_OUTPUT"
+            echo "No dependency manifest found — install and pip-cache steps will be skipped"
+          fi
+
+      # ── 3. Set up Python (with built-in pip cache) ─────────────────────
+      # Installs the requested Python version. pip cache is only enabled when a
+      # dependency manifest was detected (step 2) — setup-python@v5 throws
+      # "No file matching [...] found" when cache: pip is set but no
+      # requirements-style file exists in the repo, so the conditional prevents
+      # that error on repos that have not yet committed their manifest.
       - name: Set up Python ${{ inputs.python-version }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ inputs.python-version }}
-          cache: pip
+          cache: ${{ steps.detect-deps.outputs.has_deps == 'true' && 'pip' || '' }}
 
-      # ── 3. Restore pip package cache (two-level key) ───────────────────────
+      # ── 4. Restore pip package cache (two-level key) ─────────────────────
       # Caches the pip download cache at ~/.cache/pip.
-      #
-      # Two-level key strategy:
-      #   Primary  – OS + "pip" + hash(requirements.txt): exact match; cache is
-      #              fully valid only when requirements haven't changed.
-      #   Fallback – OS + "pip": partial match; restores the closest available
-      #              cache so only new/changed packages are downloaded.
-      #
-      # This sits alongside setup-python's built-in cache (step 2) to give full
-      # visibility and control over what is stored and when it is invalidated.
+      # hashFiles('**/requirements*.txt') returns an empty string when no
+      # requirements file exists — this is safe; the key becomes identical to
+      # the restore-key fallback so only cached wheels from prior runs are used.
+      # The step itself still runs when has_deps=false because caching unrelated
+      # pip installs (e.g. pre-warm packages) is still worthwhile.
       - name: Restore pip package cache
         uses: actions/cache@v4
         with:
@@ -81,11 +130,11 @@ jobs:
             ${{ runner.os }}-pip-${{ inputs.python-version }}-
             ${{ runner.os }}-pip-
 
-      # ── 4. Restore virtual environment cache ──────────────────────────────
-      # If the project uses a .venv directory, caching it avoids recreating and
-      # re-populating the virtual environment on every run. Keyed on Python
-      # version + requirements hash so it invalidates when either changes.
-      # Placed before any pip install calls so the restored .venv is ready.
+      # ── 5. Restore virtual environment cache ────────────────────────────
+      # Caches the .venv directory when the project uses one. hashFiles returns
+      # '' when no requirements file exists, which is fine — the key collapses
+      # to the restore-key fallback and the cache step is still a no-op rather
+      # than an error.
       - name: Restore virtual environment cache
         uses: actions/cache@v4
         with:
@@ -94,7 +143,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-venv-${{ inputs.python-version }}-
 
-      # ── 5. Pre-warm cache with common packages ─────────────────────────────
+      # ── 6. Pre-warm cache with common packages ─────────────────────────────
       # Installs the most-used packages across apprenticeship lab repos so that
       # most repos hit the pip cache on their very first run rather than
       # downloading everything cold. The packages covered are:
@@ -107,26 +156,112 @@ jobs:
       - name: Pre-warm pip cache with common packages
         run: pip install --quiet pytest pytest-cov flake8 requests
 
-      # ── 6. Lint (flake8) ───────────────────────────────────────────────────
+      # ── 7. Detect Python files ─────────────────────────────────────────────
+      # Checks whether the repository contains any .py files before running
+      # flake8. An early-stage repo with only config files or a bare scaffold
+      # has no Python source to lint — skipping flake8 prevents a confusing
+      # "no files found" or false-positive failure in that case.
+      - name: Detect Python files
+        id: detect-python
+        run: |
+          if find . -name "*.py" -not -path "./.git/*" -not -path "./.venv/*" \
+                                 -not -path "./venv/*" -not -path "./env/*" | grep -q .; then
+            echo "has_python=true"  >> "$GITHUB_OUTPUT"
+            echo "Python files detected"
+          else
+            echo "has_python=false" >> "$GITHUB_OUTPUT"
+            echo "No .py files found — flake8 step will be skipped"
+          fi
+
+      # ── 8. Lint (flake8) ───────────────────────────────────────────────────
       # Run flake8 before installing project dependencies so style violations
       # are caught as early as possible. A max-line-length of 120 matches the
       # convention used in apprenticeship labs. Failing here stops the pipeline
       # before the heavier install + test steps run, saving runner minutes.
+      # Gated on detect-python (step 7) so it is skipped when no .py files exist.
       - name: Lint — flake8
+        if: steps.detect-python.outputs.has_python == 'true'
         run: flake8 . --max-line-length=120 --extend-exclude=.venv,venv,env,.env
 
-      # ── 7. Install project dependencies ───────────────────────────────────
-      # Install from requirements.txt after lint passes. Upgrade pip first to
-      # ensure modern resolver behaviour and avoid legacy warnings in logs.
-      # If no requirements.txt exists the step is skipped gracefully.
-      - name: Install dependencies
+      # ── 9. Detect Dockerfile ───────────────────────────────────────────────
+      # Python repos may include a Dockerfile for containerising the app.
+      # Only run hadolint when one is actually present — avoids the empty-glob
+      # "does not exist" error from hadolint-action on pure Python repos.
+      - name: Detect Dockerfile
+        id: detect-dockerfile
         run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
+          if find . -name "Dockerfile*" -not -path "./.git/*" | grep -q .; then
+            echo "has_dockerfile=true"  >> "$GITHUB_OUTPUT"
+            echo "Dockerfile detected"
+          else
+            echo "has_dockerfile=false" >> "$GITHUB_OUTPUT"
+            echo "No Dockerfile found — hadolint step will be skipped"
           fi
 
-      # ── 8. Trivy Python dependency CVE scan ───────────────────────────────
+      # ── 10. Dockerfile lint (hadolint) ────────────────────────────────────
+      # Validates Dockerfile best practices when a Dockerfile is present.
+      # failure-threshold: warning surfaces DL-level errors without failing
+      # on INFO/STYLE findings — keeps the signal-to-noise ratio high.
+      - name: Lint — Dockerfile (hadolint)
+        if: steps.detect-dockerfile.outputs.has_dockerfile == 'true'
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          recursive: true
+          failure-threshold: warning
+
+      # ── 11. Install project dependencies ───────────────────────────────────
+      # Only runs when a manifest was detected (step 2). Supports all common
+      # manifest types in priority order. If Python source files exist but no
+      # manifest was found a ::warning is emitted so the apprentice knows why
+      # dependencies were not installed — this is a warning not a hard failure
+      # because the project may vendor its deps or use system packages.
+      - name: Install dependencies
+        run: |
+          DEPS_TYPE="${{ steps.detect-deps.outputs.deps_type }}"
+          HAS_PYTHON="${{ steps.detect-python.outputs.has_python }}"
+
+          if [[ "$DEPS_TYPE" == "none" ]]; then
+            if [[ "$HAS_PYTHON" == "true" ]]; then
+              echo "::warning title=No Dependency Manifest::Python source files found but no dependency manifest detected (requirements*.txt, pyproject.toml, Pipfile, setup.cfg, setup.py). Dependencies were not installed — add a manifest so the test suite can run against your actual packages."
+            else
+              echo "No dependency manifest and no Python source files — skipping install"
+            fi
+            exit 0
+          fi
+
+          python -m pip install --upgrade pip
+
+          case "$DEPS_TYPE" in
+            requirements)
+              # Install all requirements files found (supports extras like
+              # requirements-dev.txt, requirements-test.txt, etc.)
+              find . -maxdepth 3 -name "requirements*.txt" -not -path "./.git/*" \
+                | sort | while read -r req; do
+                echo "Installing from $req"
+                pip install --quiet -r "$req"
+              done
+              ;;
+            pyproject)
+              echo "Installing from pyproject.toml"
+              pip install --quiet .
+              ;;
+            pipfile)
+              echo "Installing from Pipfile"
+              pip install --quiet pipenv
+              pipenv install --dev --system --deploy
+              ;;
+            setuptools)
+              if [[ -f setup.cfg ]]; then
+                echo "Installing from setup.cfg"
+                pip install --quiet -e .
+              elif [[ -f setup.py ]]; then
+                echo "Installing from setup.py"
+                pip install --quiet -e .
+              fi
+              ;;
+          esac
+
+      # ── 12. Trivy Python dependency CVE scan ───────────────────────────────
       # Scans project dependency manifests (requirements.txt, Pipfile.lock,
       # poetry.lock, pyproject.toml — detected automatically by Trivy) against
       # known CVEs in the Python ecosystem.
@@ -151,7 +286,7 @@ jobs:
           scanners: vuln
           skip-dirs: ".venv,venv,env,.env"
 
-      # ── 9. Run tests with coverage ─────────────────────────────────────────
+      # ── 13. Run tests with coverage ─────────────────────────────────────────
       # Execute the full test suite using pytest. --cov=. measures coverage
       # across the entire project root; --cov-report=xml writes coverage.xml
       # which is consumed by the SonarQube workflow downstream.
@@ -200,7 +335,7 @@ jobs:
             fi
           fi
 
-      # ── 10. Upload build artifacts ─────────────────────────────────────────
+      # ── 14. Upload build artifacts ───────────────────────────────────────
       # Persist the JaCoCo-equivalent coverage.xml so the downstream SonarQube
       # workflow can import it without re-running the test suite.
       # if-no-files-found: warn avoids a hard failure if pytest exits before

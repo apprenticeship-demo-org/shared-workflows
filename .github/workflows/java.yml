@@ -74,6 +74,35 @@ jobs:
             echo "::warning title=No Build Tool Detected::No recognized build file found (gradlew, pom.xml, build.xml). Add your project files and push again."
           fi
 
+      # ── 3b. Detect Dockerfile ─────────────────────────────────────────────
+      # Java repos may package their app in a container image. Only run
+      # hadolint when a Dockerfile is actually present — avoids the empty-glob
+      # "does not exist" error from hadolint-action on pure Java repos that
+      # deploy via Maven/Gradle without any Docker content.
+      - name: Detect Dockerfile
+        id: detect-dockerfile
+        run: |
+          if find . -name "Dockerfile*" -not -path "./.git/*" | grep -q .; then
+            echo "has_dockerfile=true"  >> "$GITHUB_OUTPUT"
+            echo "Dockerfile detected"
+          else
+            echo "has_dockerfile=false" >> "$GITHUB_OUTPUT"
+            echo "No Dockerfile found — hadolint step will be skipped"
+          fi
+
+      # ── 3c. Dockerfile lint (hadolint) ────────────────────────────────────
+      # Validates Dockerfile best practices when a Dockerfile is present.
+      # Runs before the build so Docker issues surface alongside source errors
+      # rather than after the expensive compile + test cycle.
+      # failure-threshold: warning surfaces DL-level errors without failing
+      # on INFO/STYLE findings — keeps the signal-to-noise ratio high.
+      - name: Lint — Dockerfile (hadolint)
+        if: steps.detect-dockerfile.outputs.has_dockerfile == 'true'
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          recursive: true
+          failure-threshold: warning
+
       # ── 4a. Restore Maven repository cache ────────────────────────────────
       - name: Restore Maven cache
         if: steps.detect.outputs.tool == 'maven'

@@ -7,29 +7,31 @@
 # Step order rationale
 # ─────────────────────────────────────────────────────────────────────────────
 #  1.  checkout                 – source must be present before any tooling runs
-#  2.  restore pip cache        – yamllint is Python-based; cache before install
-#  3.  install yamllint         – fast Python install; needed for step 4
-#  4.  YAML lint                – broadest check (hits almost every file); run
-#                                 first to catch syntax errors before tool-specific
-#                                 linters which may misread malformed YAML
-#  5.  Dockerfile lint          – hadolint; fast static analysis of Dockerfiles
-#  6.  detect Terraform         – sets has_terraform output; gates steps 7–11
-#  7.  restore Terraform cache  – restore provider plugin cache before init
-#  8.  setup Terraform          – installs terraform binary
-#  9.  terraform init           – downloads providers into plugin cache
-# 10.  terraform validate       – validates HCL syntax and module references
-# 11.  restore TFLint cache     – restore TFLint plugin cache before setup
-# 12.  setup and run TFLint     – lints Terraform style and best practices
-# 13.  detect Helm              – sets has_helm output; gates step 14
-# 14.  restore Helm cache       – restore chart dep cache before lint
-# 15.  Helm lint                – validates chart structure and values
-# 16.  detect Jenkinsfile       – sets has_jenkinsfile output; gates step 17
-# 17.  Jenkinsfile validate     – syntax check via declarative-linter
-# 18.  detect shell scripts     – sets has_shell output; gates step 19
-# 19.  shellcheck               – lints all .sh files for errors and best practices
-# 20.  detect Python scripts    – sets has_python output; gates step 21
-# 21.  flake8                   – lints all .py utility scripts (120-char line limit)
-# 22.  upload artifacts         – always runs; preserves all IaC files for audit
+#  2.  detect YAML files        – gates steps 3–5; skip if no .yml/.yaml present
+#  3.  restore pip cache        – yamllint is Python-based; cache before install
+#  4.  install yamllint         – fast Python install; needed for step 5
+#  5.  YAML lint                – broadest check; runs first to catch syntax errors
+#                                 before tool-specific linters which may misread
+#                                 malformed YAML
+#  6.  detect Dockerfile        – gates steps 7; skip if no Dockerfile present
+#  7.  Dockerfile lint          – hadolint; fast static analysis of Dockerfiles
+#  8.  detect Terraform         – sets has_terraform output; gates steps 9–14
+#  9.  restore Terraform cache  – restore provider plugin cache before init
+# 10.  setup Terraform          – installs terraform binary
+# 11.  terraform init           – downloads providers into plugin cache
+# 12.  terraform validate       – validates HCL syntax and module references
+# 13.  restore TFLint cache     – restore TFLint plugin cache before setup
+# 14.  setup and run TFLint     – lints Terraform style and best practices
+# 15.  detect Helm              – sets has_helm output; gates steps 16–17
+# 16.  restore Helm cache       – restore chart dep cache before lint
+# 17.  Helm lint                – validates chart structure and values
+# 18.  detect Jenkinsfile       – sets has_jenkinsfile output; gates step 19
+# 19.  Jenkinsfile validate     – syntax check via declarative-linter
+# 20.  detect shell scripts     – sets has_shell output; gates step 21
+# 21.  shellcheck               – lints all .sh files for errors and best practices
+# 22.  detect Python scripts    – sets has_python output; gates step 23
+# 23.  flake8                   – lints all .py utility scripts (120-char line limit)
+# 24.  upload artifacts         – always runs; preserves all IaC files for audit
 
 name: DevOps CI
 
@@ -80,13 +82,29 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── 2. Restore pip cache ───────────────────────────────────────────────
+      # ── 2. Detect YAML files ───────────────────────────────────────────────
+      # Checks whether the repository contains any .yml or .yaml files before
+      # running any YAML tooling. Steps 3–5 all depend on this output being
+      # 'true'. Skipping pip cache restore, yamllint install, and the lint
+      # itself on repos with no YAML keeps the pipeline fast and avoids
+      # spurious output on repos that only contain Terraform or shell scripts.
+      - name: Detect YAML files
+        id: detect-yaml
+        run: |
+          if find . -name "*.yml" -o -name "*.yaml" | grep -v "./.git/" | grep -q .; then
+            echo "has_yaml=true"  >> "$GITHUB_OUTPUT"
+            echo "YAML files detected"
+          else
+            echo "has_yaml=false" >> "$GITHUB_OUTPUT"
+            echo "No .yml/.yaml files found — YAML lint steps will be skipped"
+          fi
+
+      # ── 3. Restore pip cache ───────────────────────────────────────────────
       # yamllint is installed via pip. Caching ~/.cache/pip before the install
-      # step avoids re-downloading the wheel on every run. The key includes
-      # "devops-pip" as a fixed segment so it does not conflict with other
-      # pip caches in the same runner OS. The restore-key fallback restores
-      # the nearest cache even when the exact key is not found.
-      - name: Restore pip cache (yamllint and Python-based tools)
+      # step avoids re-downloading the wheel on every run. Gated on
+      # detect-yaml so the cache action is not even invoked on non-YAML repos.
+      - name: Restore pip cache (yamllint)
+        if: steps.detect-yaml.outputs.has_yaml == 'true'
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
@@ -94,14 +112,14 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-devops-pip
 
-      # ── 3. Install yamllint ────────────────────────────────────────────────
-      # Installed after the pip cache is restored so it is available for the
-      # YAML lint step. Installed globally into the runner Python so it can
-      # be invoked as `yamllint` without npx or a venv prefix.
+      # ── 4. Install yamllint ────────────────────────────────────────────────
+      # Only installed when YAML files were detected. Installed globally into
+      # the runner Python so it can be invoked as `yamllint` without a venv.
       - name: Install yamllint
+        if: steps.detect-yaml.outputs.has_yaml == 'true'
         run: pip install --quiet yamllint
 
-      # ── 4. YAML lint ───────────────────────────────────────────────────────
+      # ── 5. YAML lint ───────────────────────────────────────────────────────
       # Lints all .yml and .yaml files in the repository. This is the broadest
       # check and runs first because YAML syntax errors cause misleading
       # failures in every tool-specific step that follows.
@@ -111,6 +129,7 @@ jobs:
       # absent, yamllint falls back to its own defaults so the step never fails
       # simply because a config file is missing.
       - name: Lint — YAML (yamllint)
+        if: steps.detect-yaml.outputs.has_yaml == 'true'
         run: |
           if [[ "${{ inputs.yamllint-strict }}" == "true" ]]; then
             STRICT_FLAG="--strict"
@@ -125,26 +144,39 @@ jobs:
             echo "Using project .yamllint.yaml config"
             yamllint $STRICT_FLAG -c .yamllint.yaml .
           else
-            # No project config found — fall back to yamllint defaults.
-            # This is intentional: early-stage repos should not fail because
-            # they have not yet added a yamllint config file.
             echo "No .yamllint.yml found — using yamllint default configuration"
             yamllint $STRICT_FLAG .
           fi
 
-      # ── 5. Dockerfile lint (hadolint) ──────────────────────────────────────
+      # ── 5. Detect Dockerfile ───────────────────────────────────────────────
+      # Checks whether any Dockerfile (or Dockerfile.*) exists in the repo
+      # before running hadolint. DevOps labs may focus on Terraform, Helm, or
+      # shell scripting without any Docker content — skipping hadolint prevents
+      # the "does not exist" / "No such file or directory" error produced by
+      # hadolint-action when it receives a glob that matches nothing.
+      - name: Detect Dockerfile
+        id: detect-dockerfile
+        run: |
+          if find . -name "Dockerfile*" -not -path "./.git/*" | grep -q .; then
+            echo "has_dockerfile=true"  >> "$GITHUB_OUTPUT"
+            echo "Dockerfile detected"
+          else
+            echo "has_dockerfile=false" >> "$GITHUB_OUTPUT"
+            echo "No Dockerfile found — hadolint step will be skipped"
+          fi
+
+      # ── 6. Dockerfile lint (hadolint) ──────────────────────────────────────
       # Scans all Dockerfiles in the repository recursively. hadolint validates
       # Dockerfile best practices (layer order, --no-cache on apt-get, etc.).
+      # Gated on detect-dockerfile (Step 5) so it only runs when a Dockerfile
+      # is actually present — this prevents the empty-glob failure from
+      # hadolint-action when the repo has no Docker content at all.
       #
       # failure-threshold: warning means the step fails only on DL-level
       # errors, not on INFO/STYLE findings, reducing noise for apprentices
       # who are still learning Dockerfile conventions.
-      #
-      # Graceful fallback: hadolint-action uses --recursive so it finds all
-      # Dockerfiles regardless of name or subdirectory. If no Dockerfile exists
-      # the action produces no findings and exits 0 — no conditional guard is
-      # needed here.
       - name: Lint — Dockerfile (hadolint)
+        if: steps.detect-dockerfile.outputs.has_dockerfile == 'true'
         uses: hadolint/hadolint-action@v3.1.0
         with:
           recursive: true
