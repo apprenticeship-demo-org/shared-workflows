@@ -57,8 +57,7 @@ jobs:
     name: CI pipeline
     needs: changes
     if: needs.changes.outputs.run == 'true'
-    # ── Replace <YOUR-ORG> with your GitHub organisation name ──────────────
-    uses: <YOUR-ORG>/shared-workflows/.github/workflows/pipeline.yml@main
+    uses: apprenticeship-demo-org/shared-workflows/.github/workflows/pipeline.yml@main
     secrets: inherit
     # Optional overrides — uncomment and edit only the lines you need:
     # with:

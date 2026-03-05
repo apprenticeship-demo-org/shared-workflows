@@ -17,8 +17,8 @@
 # Called by pipeline.yml on pull_request events only (never on push).
 #
 # Required org secrets:
-#   CI_APP_ID    — GitHub App ID
-#   CI_PEM_FILE  — GitHub App private key (.pem contents)
+#   CI_APP_ID          — GitHub App ID
+#   CI_APP_PRIVATE_KEY — GitHub App private key (.pem contents)
 
 on:
   workflow_call:
@@ -74,7 +74,7 @@ jobs:
         uses: actions/create-github-app-token@v1
         with:
           app-id: ${{ secrets.CI_APP_ID }}
-          private-key: ${{ secrets.CI_PEM_FILE }}
+          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
 
       # ── 4. Install PDF extraction tool ──────────────────────────────────────
       - name: Install poppler-utils
