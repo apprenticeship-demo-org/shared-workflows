@@ -44,13 +44,18 @@ jobs:
 
     steps:
 
-      # ── 1. Checkout the PR branch (with write credentials) ──────────────────
+      # ── 1. Checkout the PR branch ────────────────────────────────────────────
+      # persist-credentials: false prevents checkout from storing GITHUB_TOKEN
+      # in git's credential helper. Without this, the stored credential overrides
+      # the App token we embed in the remote URL in step 7, causing the push to
+      # authenticate as GITHUB_TOKEN (no bypass) instead of the App.
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           ref: ${{ github.head_ref }}
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
+          persist-credentials: false
 
       # ── 2. Idempotency guard ─────────────────────────────────────────────────
       - name: Check if copilot-instructions.md already exists
@@ -228,7 +233,9 @@ jobs:
       # ── 8. Assign @copilot as PR reviewer ───────────────────────────────────
       # Always runs — Copilot must be requested on every PR, not just the first
       # one that created copilot-instructions.md.
+      # if: always() ensures this step runs even if the commit step failed.
       - name: Assign Copilot as reviewer
+        if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
