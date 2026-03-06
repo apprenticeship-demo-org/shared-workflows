@@ -35,6 +35,11 @@ on:
         type: string
         default: "latest"
       # ── Quality gate overrides ────────────────────────────────────────────
+      run-sonarqube:
+        description: "Set to false to skip SonarQube analysis (default: true)"
+        required: false
+        type: boolean
+        default: true
       sonar-project-key:
         description: "SonarQube / SonarCloud project key (falls back to repo name)"
         required: false
@@ -147,7 +152,8 @@ jobs:
   sonarqube:
     name: SonarQube analysis
     needs: [read-profile, java, python, javascript, devops]
-    if: always() && !failure() && !cancelled()
+    # Toggle centrally: change the default of the run-sonarqube input above.
+    if: always() && !failure() && !cancelled() && inputs.run-sonarqube
     uses: ./.github/workflows/sonarqube.yml
     with:
       project-key: ${{ inputs.sonar-project-key }}
